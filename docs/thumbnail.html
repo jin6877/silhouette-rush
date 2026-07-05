@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      body { margin: 0; }
+      .poster {
+        width: 1200px;
+        height: 630px;
+        overflow: hidden;
+        position: relative;
+        font-family: -apple-system, "Pretendard", "Malgun Gothic", sans-serif;
+        background:
+          radial-gradient(ellipse 60% 70% at 82% 30%, rgba(255,46,154,0.28), transparent 60%),
+          radial-gradient(ellipse 55% 60% at 8% 12%, rgba(34,233,255,0.22), transparent 62%),
+          radial-gradient(ellipse 80% 80% at 50% 120%, rgba(61,28,114,0.6), transparent 70%),
+          linear-gradient(150deg, #180a2e 0%, #0d0518 55%, #08030f 100%);
+        color: #f4ecff;
+      }
+      .grid {
+        position: absolute;
+        inset: 45% 0 0 0;
+        background-image:
+          linear-gradient(rgba(34,233,255,0.14) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(255,46,154,0.11) 1px, transparent 1px);
+        background-size: 46px 46px;
+        transform: perspective(420px) rotateX(58deg);
+        transform-origin: top center;
+        opacity: 0.6;
+        mask-image: linear-gradient(to bottom, black, transparent 82%);
+      }
+      .scan {
+        position: absolute; inset: 0;
+        background: repeating-linear-gradient(to bottom, transparent 0, transparent 3px, rgba(0,0,0,0.10) 3px, rgba(0,0,0,0.10) 4px);
+        mix-blend-mode: overlay; opacity: 0.5;
+      }
+      .content {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        padding: 64px 60px;
+        gap: 30px;
+      }
+      .left { width: 512px; flex: none; }
+      .badge {
+        display: inline-flex; align-items: center; gap: 9px;
+        border: 1px solid rgba(168,85,247,0.5);
+        background: rgba(44,19,82,0.5);
+        padding: 9px 18px; border-radius: 999px;
+        font-size: 17px; font-weight: 700; letter-spacing: 0.5px;
+        color: #d8c7f0;
+      }
+      .dot { width: 9px; height: 9px; border-radius: 50%; background: #ff2e9a; box-shadow: 0 0 10px #ff2e9a; }
+      .kicker {
+        margin-top: 26px;
+        font-size: 21px; font-weight: 800; letter-spacing: 10px;
+        color: #7ff2ff; text-shadow: 0 0 14px rgba(34,233,255,0.7);
+      }
+      .title {
+        margin-top: 6px;
+        font-size: 118px; line-height: 0.92; font-weight: 900; letter-spacing: -3px;
+        background: linear-gradient(100deg, #22e9ff 0%, #a855f7 44%, #ff2e9a 100%);
+        -webkit-background-clip: text; background-clip: text; color: transparent;
+        filter: drop-shadow(0 6px 26px rgba(168,85,247,0.5));
+      }
+      .tagline {
+        margin-top: 22px;
+        font-size: 30px; font-weight: 700; line-height: 1.35; color: #eadcff;
+      }
+      .tagline b { color: #ff7ac2; }
+      .pills { margin-top: 26px; display: flex; gap: 10px; flex-wrap: wrap; }
+      .pill {
+        font-size: 17px; font-weight: 700; padding: 9px 16px; border-radius: 12px;
+        border: 1px solid rgba(34,233,255,0.35);
+        background: rgba(34,233,255,0.08); color: #bff1ff;
+      }
+      .pill.pink { border-color: rgba(255,46,154,0.4); background: rgba(255,46,154,0.1); color: #ffc4e2; }
+      .pill.violet { border-color: rgba(168,85,247,0.45); background: rgba(168,85,247,0.12); color: #e2ccff; }
+
+      .right { flex: 1; height: 100%; display: flex; align-items: center; justify-content: center; }
+      .mock {
+        width: 560px;
+        border-radius: 18px;
+        overflow: hidden;
+        transform: rotate(-4deg) perspective(1400px) rotateY(-13deg) scale(1.02);
+        box-shadow:
+          0 40px 90px -20px rgba(0,0,0,0.85),
+          0 0 0 1px rgba(255,255,255,0.06),
+          0 0 60px -10px rgba(255,46,154,0.45);
+      }
+      .bar {
+        height: 34px; background: linear-gradient(90deg,#241040,#1a0b30);
+        display: flex; align-items: center; gap: 7px; padding: 0 14px;
+        border-bottom: 1px solid rgba(168,85,247,0.3);
+      }
+      .bar i { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
+      .bar .r { background: #ff5f7a; } .bar .y { background: #ffcb5f; } .bar .g { background: #45e0a0; }
+      .bar span {
+        margin-left: 12px; font-size: 13px; color: #a892cc; font-weight: 600;
+        background: rgba(10,5,20,0.6); padding: 4px 14px; border-radius: 8px;
+      }
+      .mock img { display: block; width: 100%; }
+      .glow-badge {
+        position: absolute; right: 42px; top: 40px;
+        font-size: 15px; font-weight: 800; color: #0a0514;
+        background: linear-gradient(100deg,#22e9ff,#b6ff3a);
+        padding: 10px 16px; border-radius: 12px; transform: rotate(6deg);
+        box-shadow: 0 10px 30px -8px rgba(182,255,58,0.6);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="poster">
+      <div class="grid"></div>
+      <div class="content">
+        <div class="left">
+          <div class="badge"><span class="dot"></span>웹캠 전신 아케이드 · BRAIN WALL</div>
+          <div class="kicker">SILHOUETTE RUSH</div>
+          <div class="title">실루엣<br />러시</div>
+          <div class="tagline">다가오는 벽의 구멍에<br /><b>몸을 맞춰</b> 통과하라</div>
+          <div class="pills">
+            <span class="pill">🕺 전신 포즈 매칭</span>
+            <span class="pill violet">⚡ 실시간 실루엣</span>
+            <span class="pill pink">🔒 로컬 처리</span>
+          </div>
+        </div>
+        <div class="right">
+          <div class="mock">
+            <div class="bar"><i class="r"></i><i class="y"></i><i class="g"></i><span>silhouette-rush.vercel.app</span></div>
+            <img src="screenshot.png" alt="실루엣 러시 게임 화면" />
+          </div>
+        </div>
+      </div>
+      <div class="glow-badge">몸으로 통과!</div>
+      <div class="scan"></div>
+    </div>
+  </body>
+</html>

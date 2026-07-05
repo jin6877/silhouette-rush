@@ -1,0 +1,137 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", "Malgun Gothic", sans-serif;
+
+  /* 일렉트릭 아케이드 / 네온 게임쇼 무대 팔레트
+     짙은 퍼플~마젠타 스테이지 + 네온 시안/핫핑크 글로우 */
+  --color-stage-950: #0a0514;
+  --color-stage-900: #120722;
+  --color-stage-850: #180a2e;
+  --color-stage-800: #1f0d3a;
+  --color-stage-700: #2c1352;
+  --color-stage-600: #3d1c72;
+
+  --color-neon-cyan: #22e9ff;
+  --color-neon-cyan-soft: #7ff2ff;
+  --color-neon-pink: #ff2e9a;
+  --color-neon-pink-soft: #ff7ac2;
+  --color-neon-violet: #a855f7;
+  --color-neon-lime: #b6ff3a;
+
+  --color-mist-50: #f4ecff;
+  --color-mist-200: #d8c7f0;
+  --color-mist-400: #a892cc;
+  --color-mist-500: #8873ac;
+
+  --animate-fade-up: fade-up 0.6s cubic-bezier(0.22, 1, 0.36, 1) both;
+  --animate-pop-in: pop-in 0.4s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+  --animate-float: float 4s ease-in-out infinite;
+  --animate-pulse-glow: pulse-glow 2.2s ease-in-out infinite;
+  --animate-scan: scan 3.5s linear infinite;
+
+  @keyframes fade-up {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes pop-in {
+    from { opacity: 0; transform: scale(0.9); }
+    to { opacity: 1; transform: scale(1); }
+  }
+  @keyframes float {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-10px); }
+  }
+  @keyframes pulse-glow {
+    0%, 100% { opacity: 0.55; }
+    50% { opacity: 1; }
+  }
+  @keyframes scan {
+    from { transform: translateY(-100%); }
+    to { transform: translateY(100%); }
+  }
+}
+
+html {
+  background-color: var(--color-stage-950);
+}
+
+body {
+  margin: 0;
+  color: var(--color-mist-50);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+
+/* 무대 스포트라이트 배경 */
+.stage-lights {
+  background:
+    radial-gradient(ellipse 70% 55% at 50% -10%, rgba(168, 85, 247, 0.28), transparent 65%),
+    radial-gradient(ellipse 45% 50% at 12% 8%, rgba(34, 233, 255, 0.16), transparent 60%),
+    radial-gradient(ellipse 45% 50% at 88% 10%, rgba(255, 46, 154, 0.18), transparent 60%),
+    radial-gradient(ellipse 90% 60% at 50% 115%, rgba(61, 28, 114, 0.5), transparent 70%);
+}
+
+/* 원근 그리드 바닥 */
+.grid-floor {
+  background-image:
+    linear-gradient(rgba(34, 233, 255, 0.12) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 46, 154, 0.1) 1px, transparent 1px);
+  background-size: 44px 44px;
+}
+
+.neon-text-cyan {
+  color: #d9fbff;
+  text-shadow: 0 0 8px rgba(34, 233, 255, 0.9), 0 0 24px rgba(34, 233, 255, 0.55);
+}
+.neon-text-pink {
+  color: #ffe1f0;
+  text-shadow: 0 0 8px rgba(255, 46, 154, 0.9), 0 0 26px rgba(255, 46, 154, 0.5);
+}
+
+.text-neon-gradient {
+  background: linear-gradient(100deg, #22e9ff 0%, #a855f7 42%, #ff2e9a 100%);
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+}
+
+.btn-neon {
+  position: relative;
+  background: linear-gradient(100deg, #22e9ff 0%, #ff2e9a 100%);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.15) inset,
+    0 8px 30px -6px rgba(255, 46, 154, 0.6),
+    0 8px 30px -10px rgba(34, 233, 255, 0.6);
+  transition: transform 0.15s ease, box-shadow 0.2s ease, filter 0.2s ease;
+}
+.btn-neon:hover {
+  transform: translateY(-2px) scale(1.02);
+  filter: brightness(1.08);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.25) inset,
+    0 14px 40px -6px rgba(255, 46, 154, 0.75),
+    0 14px 40px -10px rgba(34, 233, 255, 0.7);
+}
+.btn-neon:active { transform: translateY(0) scale(0.99); }
+
+.glass-panel {
+  background: linear-gradient(160deg, rgba(44, 19, 82, 0.72), rgba(18, 7, 34, 0.82));
+  border: 1px solid rgba(168, 85, 247, 0.25);
+  box-shadow: 0 20px 60px -20px rgba(0, 0, 0, 0.8),
+    0 0 0 1px rgba(255, 255, 255, 0.03) inset;
+  backdrop-filter: blur(14px);
+}
+
+.progress-neon {
+  background: linear-gradient(90deg, #22e9ff 0%, #a855f7 50%, #ff2e9a 100%);
+  box-shadow: 0 0 16px rgba(168, 85, 247, 0.7);
+}
+
+::selection {
+  background-color: rgba(255, 46, 154, 0.4);
+}
+
+/* 스크롤바 숨김(게임 몰입) */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { scrollbar-width: none; }
