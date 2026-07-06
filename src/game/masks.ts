@@ -29,6 +29,55 @@ export function maskArea(m: Mask, threshold = 128): number {
   return count / d.length
 }
 
+export interface MaskBounds {
+  present: boolean
+  top: number // normalized 0..1 — highest filled row (head/hands)
+  bottom: number // normalized 0..1 — lowest filled row (feet)
+  left: number
+  right: number
+  centerX: number // normalized centroid x of filled cells
+  area: number
+}
+
+/**
+ * Tight bounding box (+ x centroid) of the filled region, in normalized 0..1
+ * coordinates. Pure — used both to derive the pose reference frame and to
+ * measure where the live player's head/feet currently sit for the framing step.
+ */
+export function maskBounds(m: Mask, threshold = 128): MaskBounds {
+  const { width: w, height: h, data } = m
+  let minX = w
+  let minY = h
+  let maxX = -1
+  let maxY = -1
+  let sumX = 0
+  let count = 0
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (data[y * w + x] > threshold) {
+        if (x < minX) minX = x
+        if (x > maxX) maxX = x
+        if (y < minY) minY = y
+        if (y > maxY) maxY = y
+        sumX += x
+        count++
+      }
+    }
+  }
+  if (count === 0) {
+    return { present: false, top: 0, bottom: 1, left: 0, right: 1, centerX: 0.5, area: 0 }
+  }
+  return {
+    present: true,
+    top: minY / h,
+    bottom: (maxY + 1) / h,
+    left: minX / w,
+    right: (maxX + 1) / w,
+    centerX: sumX / count / w,
+    area: count / (w * h),
+  }
+}
+
 // --- Geometry primitives (normalized 0..1 coordinates) ------------------
 
 function fillCircle(m: Mask, cx: number, cy: number, r: number, value = 255) {
@@ -149,7 +198,12 @@ function mid(a: [number, number], b: [number, number]): [number, number] {
   return [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]
 }
 
+// The library spans four difficulty tiers so the round can scale from big,
+// symmetric, easy-to-read shapes (tier 1–2) to narrow, awkward, asymmetric ones
+// (tier 4–5). Left/right asymmetry is used heavily so consecutive poses read as
+// clearly different. `difficulty`: 1 (easiest) .. 5 (hardest).
 export const POSES: Pose[] = [
+  // ---- Tier 1 · big symmetric (easy, low entry barrier) ----------------
   {
     id: 'stand',
     name: '차렷 자세',
@@ -168,7 +222,7 @@ export const POSES: Pose[] = [
   {
     id: 'tpose',
     name: '양팔 벌리기',
-    difficulty: 2,
+    difficulty: 1,
     draw: (m) =>
       figure(m, {
         head: [0.5, 0.17],
@@ -180,6 +234,22 @@ export const POSES: Pose[] = [
         rFoot: [0.56, 0.96],
       }),
   },
+  {
+    id: 'vDown',
+    name: '양팔 아래로 벌리기 (A자)',
+    difficulty: 1,
+    draw: (m) =>
+      figure(m, {
+        head: [0.5, 0.17],
+        neck: [0.5, 0.29],
+        hip: [0.5, 0.61],
+        lHand: [0.24, 0.68],
+        rHand: [0.76, 0.68],
+        lFoot: [0.42, 0.96],
+        rFoot: [0.58, 0.96],
+      }),
+  },
+  // ---- Tier 2 · symmetric but tighter ----------------------------------
   {
     id: 'cheer',
     name: '만세! 두 팔 위로',
@@ -197,6 +267,39 @@ export const POSES: Pose[] = [
         rFoot: [0.55, 0.96],
       }),
   },
+  {
+    id: 'goalpost',
+    name: '양팔 ㄷ자 (골대)',
+    difficulty: 2,
+    draw: (m) =>
+      figure(m, {
+        head: [0.5, 0.18],
+        neck: [0.5, 0.3],
+        hip: [0.5, 0.62],
+        lElbow: [0.26, 0.31],
+        rElbow: [0.74, 0.31],
+        lHand: [0.26, 0.13],
+        rHand: [0.74, 0.13],
+        lFoot: [0.44, 0.96],
+        rFoot: [0.56, 0.96],
+      }),
+  },
+  {
+    id: 'oneArmSide',
+    name: '한 팔만 옆으로',
+    difficulty: 2,
+    draw: (m) =>
+      figure(m, {
+        head: [0.5, 0.17],
+        neck: [0.5, 0.29],
+        hip: [0.5, 0.61],
+        lHand: [0.12, 0.3],
+        rHand: [0.6, 0.6],
+        lFoot: [0.45, 0.96],
+        rFoot: [0.55, 0.96],
+      }),
+  },
+  // ---- Tier 3 · asymmetric upper body ----------------------------------
   {
     id: 'oneArm',
     name: '한 팔 번쩍',
@@ -229,6 +332,56 @@ export const POSES: Pose[] = [
         rFoot: [0.62, 0.96],
       }),
   },
+  {
+    id: 'hipHand',
+    name: '한 손 허리 + 한 팔 위',
+    difficulty: 3,
+    draw: (m) =>
+      figure(m, {
+        head: [0.5, 0.18],
+        neck: [0.5, 0.3],
+        hip: [0.5, 0.61],
+        lElbow: [0.3, 0.44],
+        lHand: [0.42, 0.52],
+        rElbow: [0.62, 0.2],
+        rHand: [0.64, 0.04],
+        lFoot: [0.45, 0.96],
+        rFoot: [0.55, 0.96],
+      }),
+  },
+  {
+    id: 'disco',
+    name: '대각선 뻗기',
+    difficulty: 3,
+    draw: (m) =>
+      figure(m, {
+        head: [0.5, 0.18],
+        neck: [0.5, 0.3],
+        hip: [0.5, 0.61],
+        lHand: [0.16, 0.1],
+        rHand: [0.84, 0.62],
+        lFoot: [0.45, 0.96],
+        rFoot: [0.55, 0.96],
+      }),
+  },
+  {
+    id: 'chestCross',
+    name: '가슴 앞 X',
+    difficulty: 3,
+    draw: (m) =>
+      figure(m, {
+        head: [0.5, 0.18],
+        neck: [0.5, 0.3],
+        hip: [0.5, 0.61],
+        lElbow: [0.32, 0.42],
+        lHand: [0.6, 0.36],
+        rElbow: [0.68, 0.42],
+        rHand: [0.4, 0.36],
+        lFoot: [0.45, 0.96],
+        rFoot: [0.55, 0.96],
+      }),
+  },
+  // ---- Tier 4 · legs involved / big asymmetry --------------------------
   {
     id: 'star',
     name: '점프 스타 (팔·다리 활짝)',
@@ -266,6 +419,57 @@ export const POSES: Pose[] = [
       }),
   },
   {
+    id: 'kneeUp',
+    name: '한 무릎 올리기',
+    difficulty: 4,
+    draw: (m) =>
+      figure(m, {
+        head: [0.5, 0.2],
+        neck: [0.5, 0.31],
+        hip: [0.5, 0.6],
+        lHand: [0.36, 0.6],
+        rHand: [0.64, 0.6],
+        lFoot: [0.46, 0.96],
+        rKnee: [0.6, 0.62],
+        rFoot: [0.5, 0.72],
+      }),
+  },
+  {
+    id: 'tree',
+    name: '나무 자세',
+    difficulty: 4,
+    draw: (m) =>
+      figure(m, {
+        head: [0.5, 0.19],
+        neck: [0.5, 0.3],
+        hip: [0.5, 0.6],
+        lElbow: [0.42, 0.2],
+        lHand: [0.44, 0.06],
+        rElbow: [0.58, 0.2],
+        rHand: [0.56, 0.06],
+        lFoot: [0.5, 0.96],
+        rKnee: [0.64, 0.66],
+        rFoot: [0.46, 0.68],
+      }),
+  },
+  {
+    id: 'skew',
+    name: '반대로 크게 기울이기',
+    difficulty: 4,
+    draw: (m) =>
+      figure(m, {
+        head: [0.64, 0.2],
+        neck: [0.58, 0.31],
+        hip: [0.46, 0.62],
+        lHand: [0.4, 0.28],
+        rElbow: [0.72, 0.34],
+        rHand: [0.82, 0.44],
+        lFoot: [0.38, 0.96],
+        rFoot: [0.5, 0.96],
+      }),
+  },
+  // ---- Tier 5 · narrow / compound / awkward ----------------------------
+  {
     id: 'crouch',
     name: '웅크리기',
     difficulty: 5,
@@ -284,6 +488,61 @@ export const POSES: Pose[] = [
         rKnee: [0.64, 0.82],
       }),
   },
+  {
+    id: 'deepCrouch',
+    name: '깊게 웅크리기',
+    difficulty: 5,
+    draw: (m) =>
+      figure(m, {
+        head: [0.5, 0.5],
+        neck: [0.5, 0.59],
+        hip: [0.5, 0.74],
+        lElbow: [0.33, 0.64],
+        lHand: [0.38, 0.74],
+        rElbow: [0.67, 0.64],
+        rHand: [0.62, 0.74],
+        lFoot: [0.4, 0.96],
+        rFoot: [0.6, 0.96],
+        lKnee: [0.36, 0.87],
+        rKnee: [0.64, 0.87],
+      }),
+  },
+  {
+    id: 'asymReach',
+    name: '한 팔 위 + 반대 다리 옆',
+    difficulty: 5,
+    draw: (m) =>
+      figure(m, {
+        head: [0.46, 0.19],
+        neck: [0.48, 0.3],
+        hip: [0.5, 0.6],
+        lElbow: [0.4, 0.2],
+        lHand: [0.34, 0.06],
+        rElbow: [0.6, 0.4],
+        rHand: [0.64, 0.5],
+        lFoot: [0.44, 0.96],
+        rKnee: [0.66, 0.64],
+        rFoot: [0.84, 0.7],
+      }),
+  },
+  {
+    id: 'captain',
+    name: '대각 팔 + 옆 다리',
+    difficulty: 5,
+    draw: (m) =>
+      figure(m, {
+        head: [0.54, 0.19],
+        neck: [0.52, 0.3],
+        hip: [0.5, 0.6],
+        lElbow: [0.6, 0.22],
+        lHand: [0.72, 0.08],
+        rElbow: [0.44, 0.42],
+        rHand: [0.4, 0.52],
+        lFoot: [0.56, 0.96],
+        rKnee: [0.36, 0.64],
+        rFoot: [0.18, 0.72],
+      }),
+  },
 ]
 
 /** Returns a fresh hole mask for a pose (255 = open hole). */
@@ -292,6 +551,20 @@ export function buildPoseMask(pose: Pose): Mask {
   pose.draw(m)
   return m
 }
+
+/**
+ * The reference body frame the pose library is drawn in, in normalized 0..1
+ * stage coordinates: `headY` is where a standing head-top sits and `feetY`
+ * where the feet-bottom sits. Derived directly from the canonical upright pose
+ * (`stand`, arms down) so it always matches the holes the player must fit. The
+ * framing step and the on-canvas guide lines both use this so that lining a
+ * standing body up to the head/feet lines lands the silhouette in exactly the
+ * vertical band the holes occupy.
+ */
+export const BODY_FRAME: { headY: number; feetY: number } = (() => {
+  const b = maskBounds(buildPoseMask(POSES[0]))
+  return { headY: b.top, feetY: b.bottom }
+})()
 
 /**
  * Builds the SOLID wall mask for a pose (255 = solid, 0 = open hole).

@@ -9,10 +9,10 @@ import {
   buildPoseMask,
   createMask,
   judge,
-  DEFAULT_JUDGE,
   type Mask,
   type Pose,
   type JudgeResult,
+  type JudgeConfig,
 } from './masks'
 
 export type Phase = 'ready' | 'playing' | 'gameover'
@@ -24,6 +24,7 @@ export interface Wall {
   progress: number // 0 (far) .. 1 (reaches the player / judgment plane)
   travelTime: number // seconds to travel from far to player
   judged: boolean
+  judgeCfg: JudgeConfig // pass tolerance for this wall (tightens with round)
 }
 
 export type GameEvent =
@@ -50,12 +51,29 @@ export interface GameConfig {
 
 export const defaultConfig = (): GameConfig => ({
   hearts: 3,
-  startTravel: 4.6,
-  minTravel: 2.1,
-  travelDecayPerRound: 0.16,
+  // Start a touch slower than before (gentle entry with the new guide lines),
+  // but ramp faster and to a lower floor so late rounds are genuinely tense.
+  startTravel: 4.8,
+  minTravel: 1.7,
+  travelDecayPerRound: 0.2,
   gap: 0.9,
   firstDelay: 1.6,
 })
+
+/**
+ * The pass tolerance tightens as rounds progress. The first couple of rounds
+ * stay lenient (low entry barrier), then the collision tolerance shrinks and
+ * the required hole-fill grows toward a demanding ceiling. Bounds are chosen so
+ * a clean fit always passes while sloppy overlaps get punished harder late.
+ */
+export function judgeConfigForRound(round: number): JudgeConfig {
+  const t = Math.min(1, Math.max(0, (round - 2) / 16))
+  return {
+    minArea: 0.04,
+    maxCollision: 0.24 - t * 0.13, // 0.24 (lenient) → 0.11 (strict)
+    minFill: 0.26 + t * 0.08, // 0.26 → 0.34
+  }
+}
 
 export interface GameState {
   config: GameConfig
@@ -74,6 +92,7 @@ export interface GameState {
   live: LiveFit
   lastResult: JudgeResult | null
   rngState: number
+  recentPoses: string[] // ids of recently spawned poses (anti-repeat window)
   events: GameEvent[]
 }
 
@@ -97,6 +116,7 @@ export function createGame(config: GameConfig = defaultConfig(), seed = 1): Game
     live: { present: false, collisionRatio: 0, fillRatio: 0, fitting: false },
     lastResult: null,
     rngState: seed >>> 0,
+    recentPoses: [],
     events: [],
   }
 }
@@ -110,14 +130,27 @@ function rng(state: GameState): number {
   return ((t ^ (t >>> 14)) >>> 0) / 4294967296
 }
 
-/** Choose a pose whose difficulty scales with the round number. */
+/**
+ * Choose the next pose. The difficulty band widens with the round (tier 1 only
+ * at the start, up to tier 5 by ~round 8, and the very easiest tier is dropped
+ * late game), and a shuffle-bag style window excludes the most recent poses so
+ * the same shape never repeats back-to-back.
+ */
 export function pickPose(state: GameState): Pose {
   const round = state.round
-  // Difficulty band widens as rounds progress.
   const maxDiff = Math.min(5, 1 + Math.floor(round / 2))
-  const candidates = POSES.filter((p) => p.difficulty <= maxDiff)
-  const pool = candidates.length ? candidates : POSES
-  return pool[Math.floor(rng(state) * pool.length) % pool.length]
+  const minDiff = round >= 12 ? 2 : 1
+  let candidates = POSES.filter((p) => p.difficulty <= maxDiff && p.difficulty >= minDiff)
+  if (candidates.length === 0) candidates = POSES
+  const recent = state.recentPoses
+  let pool = candidates.filter((p) => !recent.includes(p.id))
+  if (pool.length === 0) pool = candidates
+  const pose = pool[Math.floor(rng(state) * pool.length) % pool.length]
+  // Remember it — keep the window smaller than the candidate pool so we never
+  // starve the choice, and grow it (up to 6) as more poses unlock.
+  const windowN = Math.max(1, Math.min(6, candidates.length - 1))
+  state.recentPoses = [pose.id, ...recent.filter((id) => id !== pose.id)].slice(0, windowN)
+  return pose
 }
 
 function travelForRound(cfg: GameConfig, round: number): number {
@@ -134,6 +167,7 @@ function spawnWall(state: GameState) {
     progress: 0,
     travelTime,
     judged: false,
+    judgeCfg: judgeConfigForRound(state.round),
   }
   state.round += 1
   state.events.push({ type: 'spawn', poseName: pose.name })
@@ -163,7 +197,7 @@ export function stepGame(state: GameState, player: Mask | null, dt: number): Gam
     wall.progress += dt / wall.travelTime
 
     // Live fit feedback every frame (drives silhouette color + meter).
-    const live = judge(wall.wallMask, p, DEFAULT_JUDGE)
+    const live = judge(wall.wallMask, p, wall.judgeCfg)
     state.live = {
       present: live.present,
       collisionRatio: live.collisionRatio,
@@ -173,7 +207,7 @@ export function stepGame(state: GameState, player: Mask | null, dt: number): Gam
 
     if (wall.progress >= 1 && !wall.judged) {
       wall.judged = true
-      const res = judge(wall.wallMask, p, DEFAULT_JUDGE)
+      const res = judge(wall.wallMask, p, wall.judgeCfg)
       state.lastResult = res
       if (res.pass) {
         state.combo += 1

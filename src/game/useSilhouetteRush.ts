@@ -7,18 +7,51 @@ import {
   finalScore,
   type GameState,
 } from './engine'
-import { GameRenderer } from './render'
+import { GameRenderer, type FramingView } from './render'
 import { WebcamMaskSource, FakeMaskSource, type MaskSource } from './maskSource'
 import { onModelProgress, getDevice } from './segmentation'
 import {
   MASK_W,
   MASK_H,
+  POSES,
   erodeMask,
   createMask,
+  buildPoseMask,
+  maskBounds,
+  BODY_FRAME,
   type Mask,
+  type MaskBounds,
 } from './masks'
 
-export type Status = 'idle' | 'loading' | 'playing' | 'gameover'
+export type Status = 'idle' | 'loading' | 'framing' | 'playing' | 'gameover'
+
+// How close (normalized 0..1) the head/feet must sit to their guide lines.
+const ALIGN_TOL = 0.06
+// Seconds the body must stay aligned before the round auto-starts (webcam only).
+const AUTO_START_HOLD = 1.8
+
+/** Where the live body's head/feet sit vs. the pose reference frame. */
+function alignmentView(b: MaskBounds | null): FramingView {
+  if (!b || !b.present) return { present: false, headOn: false, feetOn: false }
+  const headOn = Math.abs(b.top - BODY_FRAME.headY) <= ALIGN_TOL
+  // Feet-bottom is clamped at 1.0 by the frame edge, so "on" means "reaches
+  // within tolerance of the feet line" (near the bottom).
+  const feetOn = b.bottom >= BODY_FRAME.feetY - ALIGN_TOL
+  return { present: true, headOn, feetOn }
+}
+
+/** One concise, actionable framing instruction. */
+function framingHint(b: MaskBounds | null, v: FramingView): string {
+  if (!b || !v.present) return '카메라 앞에 서서 전신이 보이게 해주세요'
+  if (v.headOn && v.feetOn) return '완벽해요! 그대로 잠깐 멈추면 시작돼요'
+  const bodyH = b.bottom - b.top
+  const targetH = BODY_FRAME.feetY - BODY_FRAME.headY
+  if (b.top < BODY_FRAME.headY - ALIGN_TOL) return '한 걸음 뒤로 — 머리가 화면 위로 잘려요'
+  if (bodyH < targetH - 0.1) return '한 걸음 앞으로 — 몸이 프레임을 꽉 채우게'
+  if (!v.feetOn) return '발이 아래 선에 닿게 — 뒤로 물러나거나 카메라를 낮춰요'
+  if (!v.headOn) return '머리를 위 선까지 — 앞으로 오거나 카메라를 올려요'
+  return '머리는 위 선, 발은 아래 선에 맞춰요'
+}
 
 const BEST_KEY = 'silhouette-rush:best'
 
@@ -42,17 +75,25 @@ export interface Snapshot {
   collisionRatio: number
   fillRatio: number
   fps: number
+  // Framing step (status === 'framing')
+  headAligned: boolean
+  feetAligned: boolean
+  framingHint: string
+  holdProgress: number // 0..1 auto-start hold while fully aligned
 }
 
 interface Runtime {
   source: MaskSource
-  state: GameState
+  state: GameState | null // created when play begins (null during framing)
   renderer: GameRenderer
   raf: number
   lastT: number
   dpr: number
   fakeMatte: HTMLCanvasElement | null
   lastMatte: HTMLCanvasElement | null
+  mode: 'framing' | 'playing'
+  alignHold: number // seconds the body has stayed aligned
+  isFake: boolean
 }
 
 function emptySnapshot(best: number): Snapshot {
@@ -76,6 +117,10 @@ function emptySnapshot(best: number): Snapshot {
     collisionRatio: 0,
     fillRatio: 0,
     fps: 0,
+    headAligned: false,
+    feetAligned: false,
+    framingHint: '',
+    holdProgress: 0,
   }
 }
 
@@ -87,7 +132,9 @@ export interface SilhouetteRushApi {
   error: string | null
   /** Raw underlying failure message (worker/engine), shown as a small detail. */
   errorDetail: string | null
-  start: (opts?: { fake?: boolean }) => Promise<void>
+  start: (opts?: { fake?: boolean; framing?: boolean }) => Promise<void>
+  /** Leave the framing step and start the round (button / skip). */
+  startGame: () => void
   restart: () => void
   quit: () => void
   getLastMatte: () => HTMLCanvasElement | null
@@ -138,6 +185,17 @@ export function useSilhouetteRush(): SilhouetteRushApi {
     })
   }, [])
 
+  /** Transition from the framing step into an actual round. */
+  const beginPlay = useCallback(() => {
+    const r = rt.current
+    if (!r || r.mode === 'playing') return
+    r.renderer.reset()
+    r.state = createGame(defaultConfig(), (Date.now() & 0xffffffff) >>> 0)
+    r.alignHold = 0
+    r.mode = 'playing'
+    setSnap((s) => ({ ...emptySnapshot(s.best), status: 'playing', best: s.best }))
+  }, [])
+
   const loop = useCallback(
     (now: number) => {
       const r = rt.current
@@ -166,19 +224,51 @@ export function useSilhouetteRush(): SilhouetteRushApi {
         canvas.height = Math.max(1, needH)
       }
 
-      if (r.state.phase !== 'gameover') {
-        stepGame(r.state, mask, dt)
-        r.renderer.handleEvents(r.state.events, rect.width, rect.height)
-        for (const e of r.state.events) {
-          if (e.type === 'gameover') commitGameOver(r.state)
+      const ctx = canvas.getContext('2d')!
+
+      // --- Framing step: align head/feet to the guide lines before playing ---
+      if (r.mode === 'framing') {
+        const b = mask ? maskBounds(mask) : null
+        const view = alignmentView(b)
+        r.renderer.drawFraming(ctx, r.lastMatte, view, dt, rect.width, rect.height, r.dpr)
+
+        if (view.headOn && view.feetOn) r.alignHold += dt
+        else r.alignHold = 0
+        const hold = Math.min(1, r.alignHold / AUTO_START_HOLD)
+
+        setSnap((s) => ({
+          ...s,
+          status: 'framing',
+          phase: 'ready',
+          present: view.present,
+          headAligned: view.headOn,
+          feetAligned: view.feetOn,
+          framingHint: framingHint(b, view),
+          holdProgress: hold,
+          fps: (r.source as { fps?: number }).fps ?? 0,
+        }))
+
+        // Real webcam auto-starts after a short aligned hold; demo/test wait for
+        // the explicit button so the framing screen stays put.
+        if (!r.isFake && r.alignHold >= AUTO_START_HOLD) beginPlay()
+
+        r.raf = requestAnimationFrame(loop)
+        return
+      }
+
+      // --- Playing ---
+      const st = r.state!
+      if (st.phase !== 'gameover') {
+        stepGame(st, mask, dt)
+        r.renderer.handleEvents(st.events, rect.width, rect.height)
+        for (const e of st.events) {
+          if (e.type === 'gameover') commitGameOver(st)
         }
       }
 
-      const ctx = canvas.getContext('2d')!
-      r.renderer.draw(ctx, r.state, r.lastMatte, dt, rect.width, rect.height, r.dpr)
+      r.renderer.draw(ctx, st, r.lastMatte, dt, rect.width, rect.height, r.dpr)
 
       // Publish snapshot for the HUD.
-      const st = r.state
       setSnap((s) => ({
         ...s,
         status: st.phase === 'gameover' ? 'gameover' : 'playing',
@@ -203,11 +293,11 @@ export function useSilhouetteRush(): SilhouetteRushApi {
 
       r.raf = requestAnimationFrame(loop)
     },
-    [commitGameOver],
+    [commitGameOver, beginPlay],
   )
 
   const begin = useCallback(
-    async (opts?: { fake?: boolean }) => {
+    async (opts?: { fake?: boolean; framing?: boolean }) => {
       const canvas = canvasRef.current
       if (!canvas) return
       lastOptsRef.current = opts
@@ -256,26 +346,38 @@ export function useSilhouetteRush(): SilhouetteRushApi {
       const dpr = sizeCanvas(canvas)
       const renderer = new GameRenderer()
       renderer.reset()
-      const state = createGame(defaultConfig(), (Date.now() & 0xffffffff) >>> 0)
+
+      // Real webcam always goes through the framing step; the demo goes straight
+      // to play unless a framing screenshot is explicitly requested.
+      const useFraming = !opts?.fake || !!opts?.framing
 
       rt.current = {
         source,
-        state,
+        state: useFraming
+          ? null
+          : createGame(defaultConfig(), (Date.now() & 0xffffffff) >>> 0),
         renderer,
         raf: 0,
         lastT: performance.now(),
         dpr,
         fakeMatte: null,
         lastMatte: null,
+        mode: useFraming ? 'framing' : 'playing',
+        alignHold: 0,
+        isFake: !!opts?.fake,
       }
-      setSnap((s) => ({ ...emptySnapshot(s.best), status: 'playing', best: s.best }))
+      setSnap((s) => ({
+        ...emptySnapshot(s.best),
+        status: useFraming ? 'framing' : 'playing',
+        best: s.best,
+      }))
       rt.current.raf = requestAnimationFrame(loop)
     },
     [loop, sizeCanvas],
   )
 
   const start = useCallback(
-    (opts?: { fake?: boolean }) => {
+    (opts?: { fake?: boolean; framing?: boolean }) => {
       stop()
       return begin(opts)
     },
@@ -316,6 +418,19 @@ export function useSilhouetteRush(): SilhouetteRushApi {
     }
     w.__silhouetteRush = {
       startFake: () => start({ fake: true }),
+      // Enter the framing step with a fake source, injecting a body silhouette so
+      // the guide lines + alignment feedback are visible for screenshots.
+      startFakeFraming: async (kind?: string) => {
+        await start({ fake: true, framing: true })
+        const s = rt.current?.source
+        if (!(s instanceof FakeMaskSource)) return
+        const pose =
+          kind === 'low'
+            ? POSES.find((p) => p.id === 'crouch') ?? POSES[0]
+            : POSES[0] // 'stand' — aligned to the reference frame
+        s.setMask(buildPoseMask(pose))
+      },
+      beginPlay: () => beginPlay(),
       setFit: () => {
         const s = rt.current?.source
         if (s instanceof FakeMaskSource) s.setMask(fitMaskForWall())
@@ -351,7 +466,7 @@ export function useSilhouetteRush(): SilhouetteRushApi {
     return () => {
       delete w.__silhouetteRush
     }
-  }, [start])
+  }, [start, beginPlay])
 
   return {
     canvasRef,
@@ -361,6 +476,7 @@ export function useSilhouetteRush(): SilhouetteRushApi {
     error,
     errorDetail,
     start,
+    startGame: beginPlay,
     restart,
     quit,
     getLastMatte,

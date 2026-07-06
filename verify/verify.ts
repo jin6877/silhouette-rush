@@ -8,11 +8,19 @@ import {
   createMask,
   judge,
   maskArea,
+  maskBounds,
+  BODY_FRAME,
   MASK_W,
   MASK_H,
   type Mask,
 } from '../src/game/masks'
-import { createGame, defaultConfig, stepGame, timeToImpact } from '../src/game/engine'
+import {
+  createGame,
+  defaultConfig,
+  stepGame,
+  timeToImpact,
+  judgeConfigForRound,
+} from '../src/game/engine'
 
 let failures = 0
 function assert(cond: boolean, msg: string) {
@@ -159,6 +167,70 @@ console.log('7) 마스크 형상 sanity: 포즈 실루엣은 화면의 일부만
     const a = maskArea(buildPoseMask(pose))
     assert(a > 0.04 && a < 0.6, `[${pose.name}] 실루엣 면적 ${(a * 100).toFixed(0)}% (합리적 범위)`)
   }
+}
+
+// ---------------------------------------------------------------------------
+console.log('8) 포즈 라이브러리 다양성 + 반복 방지(같은 포즈 연속 금지)')
+{
+  assert(POSES.length >= 16, `포즈 ${POSES.length}종 (16종 이상)`)
+  const ids = new Set(POSES.map((p) => p.id))
+  assert(ids.size === POSES.length, '포즈 id 중복 없음')
+  const tiers = new Set(POSES.map((p) => p.difficulty))
+  assert(tiers.size >= 4, `난이도 티어 ${tiers.size}단계`)
+
+  // Drive a long game with a perfect player and collect the spawn order.
+  const state = createGame(defaultConfig(), 4242)
+  const dt = 1 / 60
+  const order: string[] = []
+  let frames = 0
+  while (order.length < 40 && frames < 60 * 240) {
+    const hadWall = !!state.wall
+    const player = state.wall ? erodeMask(state.wall.holeMask, 2) : null
+    stepGame(state, player, dt)
+    if (!hadWall && state.wall) order.push(state.wall.pose.name)
+    frames++
+  }
+  let repeats = 0
+  for (let i = 1; i < order.length; i++) if (order[i] === order[i - 1]) repeats++
+  assert(repeats === 0, `연속 중복 0회 (표본 ${order.length}개, 서로 다른 포즈 ${new Set(order).size}종)`)
+}
+
+// ---------------------------------------------------------------------------
+console.log('9) 정렬 기준 프레임(BODY_FRAME) + maskBounds 헬퍼')
+{
+  assert(
+    BODY_FRAME.headY < BODY_FRAME.feetY && BODY_FRAME.headY < 0.2 && BODY_FRAME.feetY > 0.9,
+    `기준선: 머리 y=${BODY_FRAME.headY.toFixed(3)} < 발 y=${BODY_FRAME.feetY.toFixed(3)}`,
+  )
+  // A body block spanning the frame reports matching bounds.
+  const block = createMask()
+  for (let y = Math.floor(0.1 * MASK_H); y < Math.floor(0.9 * MASK_H); y++)
+    for (let x = Math.floor(0.4 * MASK_W); x < Math.floor(0.6 * MASK_W); x++)
+      block.data[y * MASK_W + x] = 255
+  const b = maskBounds(block)
+  assert(
+    b.present && Math.abs(b.top - 0.1) < 0.02 && Math.abs(b.bottom - 0.9) < 0.02 && Math.abs(b.centerX - 0.5) < 0.02,
+    `bounds 정확: top=${b.top.toFixed(2)} bottom=${b.bottom.toFixed(2)} cx=${b.centerX.toFixed(2)}`,
+  )
+  assert(!maskBounds(createMask()).present, '빈 마스크는 present=false')
+}
+
+// ---------------------------------------------------------------------------
+console.log('10) 난이도 곡선: 판정 관용도가 라운드에 따라 빡세짐(단, 정확한 핏은 항상 통과)')
+{
+  const early = judgeConfigForRound(0)
+  const late = judgeConfigForRound(20)
+  assert(
+    late.maxCollision < early.maxCollision && late.minFill > early.minFill,
+    `충돌 ${early.maxCollision.toFixed(2)}→${late.maxCollision.toFixed(2)}, 채움 ${early.minFill.toFixed(2)}→${late.minFill.toFixed(2)}`,
+  )
+  // Every pose's clean fit must still pass at the strictest config.
+  let allPass = true
+  for (const pose of POSES) {
+    const r = judge(buildWallMask(pose), erodeMask(buildPoseMask(pose), 2), late)
+    if (!r.pass) allPass = false
+  }
+  assert(allPass, '가장 빡센 설정에서도 모든 포즈의 정확한 핏은 통과')
 }
 
 console.log('')
