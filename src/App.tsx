@@ -15,6 +15,7 @@ export default function App() {
         <StartScreen
           best={snap.best}
           error={game.error}
+          errorDetail={game.errorDetail}
           onStart={() => game.start()}
           onDemo={() => game.start({ fake: true })}
         />

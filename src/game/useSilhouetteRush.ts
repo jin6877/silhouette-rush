@@ -85,6 +85,8 @@ export interface SilhouetteRushApi {
   modelProgress: number
   device: string | null
   error: string | null
+  /** Raw underlying failure message (worker/engine), shown as a small detail. */
+  errorDetail: string | null
   start: (opts?: { fake?: boolean }) => Promise<void>
   restart: () => void
   quit: () => void
@@ -99,6 +101,7 @@ export function useSilhouetteRush(): SilhouetteRushApi {
   const [modelProgress, setModelProgress] = useState(0)
   const [device, setDevice] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [errorDetail, setErrorDetail] = useState<string | null>(null)
   const lastOptsRef = useRef<{ fake?: boolean } | undefined>(undefined)
 
   useEffect(() => {
@@ -209,6 +212,7 @@ export function useSilhouetteRush(): SilhouetteRushApi {
       if (!canvas) return
       lastOptsRef.current = opts
       setError(null)
+      setErrorDetail(null)
       setModelProgress(opts?.fake ? 1 : 0)
 
       const source: MaskSource = opts?.fake ? new FakeMaskSource() : new WebcamMaskSource('user')
@@ -221,12 +225,20 @@ export function useSilhouetteRush(): SilhouetteRushApi {
           await source.start()
         } catch (e) {
           const name = (e as DOMException)?.name
+          const rawMessage = (e as Error)?.message ?? String(e)
+          // Always log the real cause so failures are diagnosable from devtools.
+          console.error('[silhouette-rush] start() failed:', e)
           if (name === 'NotAllowedError' || name === 'SecurityError') {
             setError('카메라 권한이 거부됐어요. 주소창의 카메라 아이콘에서 허용해 주세요.')
+            setErrorDetail(null)
           } else if (name === 'NotFoundError' || name === 'OverconstrainedError') {
             setError('카메라를 찾을 수 없어요. 웹캠을 연결한 뒤 다시 시도해 주세요.')
+            setErrorDetail(null)
           } else {
+            // Segmentation-engine failures: surface the underlying worker/engine
+            // message so the real cause is visible on screen, not just in logs.
             setError('실루엣 인식 엔진을 불러오지 못했어요. 네트워크(카메라·모델 CDN)를 확인해 주세요.')
+            setErrorDetail(rawMessage || null)
           }
           setSnap((s) => ({ ...s, status: 'idle' }))
           source.stop()
@@ -347,6 +359,7 @@ export function useSilhouetteRush(): SilhouetteRushApi {
     modelProgress,
     device,
     error,
+    errorDetail,
     start,
     restart,
     quit,

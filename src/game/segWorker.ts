@@ -21,13 +21,20 @@ const ctx = self as unknown as {
 }
 
 async function createSegmenter(
-  modelBuffer: Uint8Array,
+  modelBytes: Uint8Array,
   wasmBase: string,
   delegate: 'GPU' | 'CPU',
 ): Promise<ImageSegmenter> {
   const fileset = await FilesetResolver.forVisionTasks(wasmBase)
+  // Hand MediaPipe a FRESH copy of the model bytes for THIS attempt. When a
+  // Uint8Array is passed as `modelAssetBuffer`, MediaPipe consumes/detaches its
+  // underlying ArrayBuffer, so reusing the same buffer for a CPU fallback after
+  // a failed GPU attempt would feed the second `createFromOptions` an empty
+  // (detached) buffer and fail every time. A per-attempt clone keeps the GPU and
+  // CPU tries fully independent.
+  const bytes = modelBytes.slice()
   return ImageSegmenter.createFromOptions(fileset, {
-    baseOptions: { modelAssetBuffer: modelBuffer, delegate },
+    baseOptions: { modelAssetBuffer: bytes, delegate },
     runningMode: 'VIDEO',
     outputConfidenceMasks: true,
     outputCategoryMask: false,
@@ -35,18 +42,34 @@ async function createSegmenter(
 }
 
 async function init(msg: InitMsg) {
-  const buffer = new Uint8Array(msg.modelBuffer)
+  // Master copy of the model bytes. We never pass THIS array to MediaPipe
+  // directly — each attempt gets its own clone via createSegmenter — so it can
+  // never be detached between the GPU and CPU tries.
+  const master = new Uint8Array(msg.modelBuffer)
+
+  // Try the GPU (WebGL) delegate first: fastest when a GPU is reachable from the
+  // worker. It may not be (e.g. macOS Chrome inside a module worker), in which
+  // case we fall back to CPU — which must succeed for the game to start.
   try {
-    segmenter = await createSegmenter(buffer, msg.wasmBase, 'GPU')
+    segmenter = await createSegmenter(master, msg.wasmBase, 'GPU')
+    console.log('[segWorker] ImageSegmenter ready via GPU (WebGL) delegate')
     ctx.postMessage({ type: 'ready', device: 'gpu' })
-  } catch {
-    // WebGL delegate unavailable (e.g. no GPU in a worker) — fall back to CPU.
-    try {
-      segmenter = await createSegmenter(buffer, msg.wasmBase, 'CPU')
-      ctx.postMessage({ type: 'ready', device: 'cpu' })
-    } catch (err) {
-      ctx.postMessage({ type: 'error', message: String((err as Error)?.message ?? err) })
-    }
+    return
+  } catch (gpuErr) {
+    console.warn(
+      '[segWorker] GPU (WebGL) delegate unavailable — falling back to CPU:',
+      String((gpuErr as Error)?.message ?? gpuErr),
+    )
+  }
+
+  try {
+    segmenter = await createSegmenter(master, msg.wasmBase, 'CPU')
+    console.log('[segWorker] ImageSegmenter ready via CPU delegate')
+    ctx.postMessage({ type: 'ready', device: 'cpu' })
+  } catch (cpuErr) {
+    const message = String((cpuErr as Error)?.message ?? cpuErr)
+    console.error('[segWorker] CPU delegate also failed — segmenter init failed:', message)
+    ctx.postMessage({ type: 'error', message })
   }
 }
 

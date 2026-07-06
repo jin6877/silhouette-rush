@@ -3,6 +3,7 @@ import { PosePreview } from './PosePreview'
 interface Props {
   best: number
   error: string | null
+  errorDetail?: string | null
   onStart: () => void
   onDemo: () => void
 }
@@ -27,7 +28,7 @@ const STEPS = [
   },
 ]
 
-export function StartScreen({ best, error, onStart, onDemo }: Props) {
+export function StartScreen({ best, error, errorDetail, onStart, onDemo }: Props) {
   return (
     <div className="stage-lights relative flex min-h-[100svh] w-full flex-col items-center overflow-hidden px-5 pb-10 pt-8 sm:pt-12">
       <div className="grid-floor pointer-events-none absolute inset-x-0 bottom-0 h-1/2 opacity-40 [mask-image:linear-gradient(to_top,black,transparent)]" />
@@ -112,6 +113,11 @@ export function StartScreen({ best, error, onStart, onDemo }: Props) {
           {error && (
             <div className="mt-2 w-full rounded-xl border border-[rgba(255,46,154,0.45)] bg-[rgba(255,46,154,0.12)] px-4 py-3 text-center text-sm text-neon-pink-soft">
               {error}
+              {errorDetail && (
+                <p className="mt-1.5 break-words font-mono text-[11px] leading-snug text-mist-500">
+                  {errorDetail}
+                </p>
+              )}
             </div>
           )}
         </div>

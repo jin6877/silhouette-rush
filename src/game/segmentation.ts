@@ -131,12 +131,23 @@ async function loadEngine(): Promise<Engine> {
   }, 140)
 
   const device = await new Promise<EngineDevice>((resolve, reject) => {
+    // Guard against a wedged init (wasm/model fetch or delegate compile that
+    // never resolves or rejects) so the UI ends with a clear error rather than
+    // an eternally-stalled loading bar.
+    const timeout = setTimeout(() => {
+      worker.removeEventListener('message', onInit)
+      reject(
+        new Error('segmenter init timed out after 20s (wasm/model load or delegate compile stalled)'),
+      )
+    }, 20000)
     const onInit = (e: MessageEvent) => {
       const msg = e.data
       if (msg?.type === 'ready') {
+        clearTimeout(timeout)
         worker.removeEventListener('message', onInit)
         resolve(msg.device as EngineDevice)
       } else if (msg?.type === 'error') {
+        clearTimeout(timeout)
         worker.removeEventListener('message', onInit)
         reject(new Error(msg.message || 'segmenter init failed'))
       }
