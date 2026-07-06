@@ -5,14 +5,64 @@
 import { MASK_W, MASK_H, createMask, type Mask } from './masks'
 import { getEngine, type Engine, type SegResult } from './segmentation'
 
+/**
+ * Capture-time framing transform. `zoom` scales the incoming camera frame about
+ * its center (zoom<1 shrinks the whole body into a padded frame so a person
+ * standing close still fits head-to-feet inside the guide lines; zoom>1 crops
+ * in for someone far away). `offsetY`/`offsetX` shift the frame (normalized
+ * fractions). This is a pure capture *pre-processing* layer applied before
+ * segmentation, so the silhouette the game judges and the silhouette drawn on
+ * screen move together and the head/feet lines stay meaningful.
+ */
+export interface CaptureTransform {
+  zoom: number
+  offsetY: number
+  offsetX?: number
+}
+
 export interface MaskSource {
   start(): Promise<void>
   /** Latest silhouette mask (MASK_W x MASK_H), or null if none yet. */
   read(): Mask | null
   stop(): void
+  /** Adjust the capture framing (zoom / vertical + horizontal offset). */
+  setTransform?(t: CaptureTransform): void
   /** Optional: a canvas holding the current alpha matte for glow rendering. */
   readonly matteCanvas?: HTMLCanvasElement | null
   readonly fps?: number
+}
+
+/**
+ * Resample a mask through the same zoom+offset transform the webcam applies to
+ * its capture canvas (scale about center + normalized offset). Used by the fake
+ * source so headless verification exercises the exact framing math. Nearest
+ * neighbour is plenty at grid resolution and stays allocation-cheap.
+ */
+export function transformMask(
+  src: Mask,
+  zoom: number,
+  offsetY: number,
+  offsetX = 0,
+): Mask {
+  const { width: w, height: h } = src
+  const out = createMask(w, h)
+  const cx = w / 2
+  const cy = h / 2
+  const offX = offsetX * w
+  const offY = offsetY * h
+  const inv = 1 / zoom
+  for (let y = 0; y < h; y++) {
+    const sy = Math.round((y - cy - offY) * inv + cy)
+    if (sy < 0 || sy >= h) continue
+    const srow = sy * w
+    const drow = y * w
+    for (let x = 0; x < w; x++) {
+      const sx = Math.round((x - cx - offX) * inv + cx)
+      if (sx < 0 || sx >= w) continue
+      out.data[drow + x] = src.data[srow + sx]
+    }
+  }
+  return out
 }
 
 // Processing resolution — the frame we hand to the segmenter. Small enough that
@@ -65,6 +115,12 @@ export class WebcamMaskSource implements MaskSource {
   private lastFpsT = 0
   private _fps = 0
 
+  // Capture framing (applied to the work canvas before segmentation, so the
+  // judged grid AND the visual matte inherit it identically).
+  private zoom = 1
+  private offsetY = 0
+  private offsetX = 0
+
   private readonly facingMode: 'user' | 'environment'
 
   constructor(facingMode: 'user' | 'environment' = 'user') {
@@ -92,6 +148,12 @@ export class WebcamMaskSource implements MaskSource {
   }
   get fps() {
     return this._fps
+  }
+
+  setTransform(t: CaptureTransform) {
+    this.zoom = t.zoom
+    this.offsetY = t.offsetY
+    this.offsetX = t.offsetX ?? 0
   }
 
   async start(): Promise<void> {
@@ -151,8 +213,14 @@ export class WebcamMaskSource implements MaskSource {
     try {
       const ctx = this.workCtx
       ctx.save()
+      // Clear first — with zoom-out the frame is padded and old pixels must go.
+      ctx.clearRect(0, 0, WORK_W, WORK_H)
+      // Zoom + offset about the frame centre, then mirror for a selfie view.
+      ctx.translate(WORK_W / 2 + this.offsetX * WORK_W, WORK_H / 2 + this.offsetY * WORK_H)
+      ctx.scale(this.zoom, this.zoom)
+      ctx.translate(-WORK_W / 2, -WORK_H / 2)
       ctx.translate(WORK_W, 0)
-      ctx.scale(-1, 1) // mirror for a natural selfie view
+      ctx.scale(-1, 1)
       ctx.drawImage(video, 0, 0, WORK_W, WORK_H)
       ctx.restore()
 
@@ -266,17 +334,27 @@ export class WebcamMaskSource implements MaskSource {
  */
 export class FakeMaskSource implements MaskSource {
   private mask: Mask | null = null
+  private zoom = 1
+  private offsetY = 0
+  private offsetX = 0
   readonly matteCanvas = null
   async start(): Promise<void> {
     /* no-op */
   }
   read(): Mask | null {
-    return this.mask
+    if (!this.mask) return null
+    if (this.zoom === 1 && this.offsetY === 0 && this.offsetX === 0) return this.mask
+    return transformMask(this.mask, this.zoom, this.offsetY, this.offsetX)
   }
   stop(): void {
     this.mask = null
   }
   setMask(mask: Mask | null) {
     this.mask = mask
+  }
+  setTransform(t: CaptureTransform) {
+    this.zoom = t.zoom
+    this.offsetY = t.offsetY
+    this.offsetX = t.offsetX ?? 0
   }
 }

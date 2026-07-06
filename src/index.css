@@ -128,6 +128,29 @@ body {
   box-shadow: 0 0 16px rgba(168, 85, 247, 0.7);
 }
 
+/* 프레이밍 줌/상하 슬라이더 — 네온 썸 */
+.zoom-slider { outline: none; }
+.zoom-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 9999px;
+  background: linear-gradient(135deg, #22e9ff, #ff2e9a);
+  border: 2px solid rgba(255, 255, 255, 0.85);
+  box-shadow: 0 0 10px rgba(34, 233, 255, 0.8), 0 0 14px rgba(255, 46, 154, 0.5);
+  cursor: pointer;
+}
+.zoom-slider::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 9999px;
+  background: linear-gradient(135deg, #22e9ff, #ff2e9a);
+  border: 2px solid rgba(255, 255, 255, 0.85);
+  box-shadow: 0 0 10px rgba(34, 233, 255, 0.8), 0 0 14px rgba(255, 46, 154, 0.5);
+  cursor: pointer;
+}
+
 ::selection {
   background-color: rgba(255, 46, 154, 0.4);
 }

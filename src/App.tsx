@@ -28,10 +28,26 @@ export default function App() {
         <canvas ref={game.canvasRef} className="block h-full w-full" />
 
         {snap.status === 'framing' && (
-          <FramingOverlay snap={snap} onStart={game.startGame} onQuit={game.quit} />
+          <FramingOverlay
+            snap={snap}
+            transform={game.transform}
+            onZoom={game.setZoom}
+            onOffsetY={game.setOffsetY}
+            onAutoFit={game.autoFit}
+            onReset={game.resetTransform}
+            onStart={game.startGame}
+            onQuit={game.quit}
+          />
         )}
 
-        {snap.status === 'playing' && <Hud snap={snap} onQuit={game.quit} />}
+        {snap.status === 'playing' && (
+          <Hud
+            snap={snap}
+            transform={game.transform}
+            onZoom={game.setZoom}
+            onQuit={game.quit}
+          />
+        )}
 
         {snap.status === 'gameover' && (
           <GameOverScreen

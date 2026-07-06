@@ -8,7 +8,12 @@ import {
   type GameState,
 } from './engine'
 import { GameRenderer, type FramingView } from './render'
-import { WebcamMaskSource, FakeMaskSource, type MaskSource } from './maskSource'
+import {
+  WebcamMaskSource,
+  FakeMaskSource,
+  type MaskSource,
+  type CaptureTransform,
+} from './maskSource'
 import { onModelProgress, getDevice } from './segmentation'
 import {
   MASK_W,
@@ -27,8 +32,31 @@ export type Status = 'idle' | 'loading' | 'framing' | 'playing' | 'gameover'
 
 // How close (normalized 0..1) the head/feet must sit to their guide lines.
 const ALIGN_TOL = 0.06
-// Seconds the body must stay aligned before the round auto-starts (webcam only).
-const AUTO_START_HOLD = 1.8
+
+// Capture-framing (zoom / vertical offset) persistence + limits.
+const TRANSFORM_KEY = 'silhouette-rush:transform'
+export const ZOOM_MIN = 0.5
+export const ZOOM_MAX = 2.0
+export const OFFSET_MIN = -0.3
+export const OFFSET_MAX = 0.3
+
+const clamp = (v: number, lo: number, hi: number) =>
+  v < lo ? lo : v > hi ? hi : v
+
+function loadTransform(): CaptureTransform {
+  const fallback: CaptureTransform = { zoom: 1, offsetY: 0, offsetX: 0 }
+  try {
+    const raw = JSON.parse(localStorage.getItem(TRANSFORM_KEY) || 'null')
+    if (!raw || typeof raw !== 'object') return fallback
+    return {
+      zoom: clamp(Number(raw.zoom) || 1, ZOOM_MIN, ZOOM_MAX),
+      offsetY: clamp(Number(raw.offsetY) || 0, OFFSET_MIN, OFFSET_MAX),
+      offsetX: clamp(Number(raw.offsetX) || 0, OFFSET_MIN, OFFSET_MAX),
+    }
+  } catch {
+    return fallback
+  }
+}
 
 /** Where the live body's head/feet sit vs. the pose reference frame. */
 function alignmentView(b: MaskBounds | null): FramingView {
@@ -43,14 +71,14 @@ function alignmentView(b: MaskBounds | null): FramingView {
 /** One concise, actionable framing instruction. */
 function framingHint(b: MaskBounds | null, v: FramingView): string {
   if (!b || !v.present) return '카메라 앞에 서서 전신이 보이게 해주세요'
-  if (v.headOn && v.feetOn) return '완벽해요! 그대로 잠깐 멈추면 시작돼요'
+  if (v.headOn && v.feetOn) return '완벽해요! 아래 시작 버튼을 누르세요'
   const bodyH = b.bottom - b.top
   const targetH = BODY_FRAME.feetY - BODY_FRAME.headY
-  if (b.top < BODY_FRAME.headY - ALIGN_TOL) return '한 걸음 뒤로 — 머리가 화면 위로 잘려요'
-  if (bodyH < targetH - 0.1) return '한 걸음 앞으로 — 몸이 프레임을 꽉 채우게'
-  if (!v.feetOn) return '발이 아래 선에 닿게 — 뒤로 물러나거나 카메라를 낮춰요'
-  if (!v.headOn) return '머리를 위 선까지 — 앞으로 오거나 카메라를 올려요'
-  return '머리는 위 선, 발은 아래 선에 맞춰요'
+  if (b.top < BODY_FRAME.headY - ALIGN_TOL) return '줌을 줄이거나 뒤로 — 머리가 위로 잘려요'
+  if (bodyH < targetH - 0.1) return '줌을 키우거나 앞으로 — 몸이 프레임을 꽉 채우게'
+  if (!v.feetOn) return '발이 아래 선에 닿게 — 줌을 줄이거나 뒤로 물러나요'
+  if (!v.headOn) return '머리를 위 선까지 — 줌을 키우거나 앞으로 오세요'
+  return '줌 슬라이더로 머리는 위 선, 발은 아래 선에 맞춰요'
 }
 
 const BEST_KEY = 'silhouette-rush:best'
@@ -79,7 +107,6 @@ export interface Snapshot {
   headAligned: boolean
   feetAligned: boolean
   framingHint: string
-  holdProgress: number // 0..1 auto-start hold while fully aligned
 }
 
 interface Runtime {
@@ -92,7 +119,6 @@ interface Runtime {
   fakeMatte: HTMLCanvasElement | null
   lastMatte: HTMLCanvasElement | null
   mode: 'framing' | 'playing'
-  alignHold: number // seconds the body has stayed aligned
   isFake: boolean
 }
 
@@ -120,7 +146,6 @@ function emptySnapshot(best: number): Snapshot {
     headAligned: false,
     feetAligned: false,
     framingHint: '',
-    holdProgress: 0,
   }
 }
 
@@ -133,11 +158,18 @@ export interface SilhouetteRushApi {
   /** Raw underlying failure message (worker/engine), shown as a small detail. */
   errorDetail: string | null
   start: (opts?: { fake?: boolean; framing?: boolean }) => Promise<void>
-  /** Leave the framing step and start the round (button / skip). */
+  /** Leave the framing step and start the round (explicit button / skip). */
   startGame: () => void
   restart: () => void
   quit: () => void
   getLastMatte: () => HTMLCanvasElement | null
+  /** Live capture framing (zoom / vertical offset) + controls. */
+  transform: CaptureTransform
+  setZoom: (zoom: number) => void
+  setOffsetY: (offsetY: number) => void
+  /** Measure the live silhouette and snap zoom/offset so head+feet hit the lines. */
+  autoFit: () => void
+  resetTransform: () => void
 }
 
 export function useSilhouetteRush(): SilhouetteRushApi {
@@ -151,6 +183,11 @@ export function useSilhouetteRush(): SilhouetteRushApi {
   const [errorDetail, setErrorDetail] = useState<string | null>(null)
   const lastOptsRef = useRef<{ fake?: boolean } | undefined>(undefined)
 
+  // Capture framing (zoom/offset). Restored from localStorage; a ref mirrors it
+  // so imperative callbacks (autoFit, source (re)start) read the live value.
+  const [transform, setTransform] = useState<CaptureTransform>(() => loadTransform())
+  const transformRef = useRef(transform)
+
   useEffect(() => {
     const raw = Number(localStorage.getItem(BEST_KEY) || '0')
     const b = Number.isNaN(raw) ? 0 : raw
@@ -159,6 +196,60 @@ export function useSilhouetteRush(): SilhouetteRushApi {
   }, [])
 
   useEffect(() => onModelProgress((p) => setModelProgress(p)), [])
+
+  // Whenever the framing transform changes, persist it AND push it straight into
+  // the live source instance so the very next captured frame is zoomed. This is
+  // the link that makes the slider actually move the silhouette.
+  useEffect(() => {
+    transformRef.current = transform
+    try {
+      localStorage.setItem(TRANSFORM_KEY, JSON.stringify(transform))
+    } catch {
+      /* ignore quota/private-mode */
+    }
+    rt.current?.source.setTransform?.(transform)
+  }, [transform])
+
+  const setZoom = useCallback((zoom: number) => {
+    setTransform((t) => ({ ...t, zoom: clamp(zoom, ZOOM_MIN, ZOOM_MAX) }))
+  }, [])
+
+  const setOffsetY = useCallback((offsetY: number) => {
+    setTransform((t) => ({ ...t, offsetY: clamp(offsetY, OFFSET_MIN, OFFSET_MAX) }))
+  }, [])
+
+  const resetTransform = useCallback(() => {
+    setTransform({ zoom: 1, offsetY: 0, offsetX: 0 })
+  }, [])
+
+  /**
+   * Measure where the live silhouette's head/feet currently sit (through the
+   * transform already in effect) and solve for the zoom+offset that lands the
+   * body's head on the head line and feet on the feet line — a one-tap framing.
+   * Works from the current transform so it composes correctly even after manual
+   * slider tweaks. (Scale about centre + normalized offset is affine, so this is
+   * a direct algebraic solve, clamped to the slider range.)
+   */
+  const autoFit = useCallback(() => {
+    const r = rt.current
+    if (!r) return
+    const mask = r.source.read()
+    const b = mask ? maskBounds(mask) : null
+    if (!b || !b.present) return
+    const t = transformRef.current
+    const dispH = b.bottom - b.top
+    if (dispH < 0.02) return
+    const targetH = BODY_FRAME.feetY - BODY_FRAME.headY
+    const zoom = clamp(t.zoom * (targetH / dispH), ZOOM_MIN, ZOOM_MAX)
+    // Un-transform the body's centre back to "raw" (centre-relative) coords,
+    // then re-place it centred between the two guide lines at the new zoom.
+    const rawMidC = ((b.top + b.bottom) / 2 - 0.5 - t.offsetY) / t.zoom
+    const targetMid = (BODY_FRAME.headY + BODY_FRAME.feetY) / 2
+    const offsetY = clamp(targetMid - 0.5 - rawMidC * zoom, OFFSET_MIN, OFFSET_MAX)
+    const rawCxC = (b.centerX - 0.5 - (t.offsetX ?? 0)) / t.zoom
+    const offsetX = clamp(-rawCxC * zoom, OFFSET_MIN, OFFSET_MAX)
+    setTransform({ zoom, offsetY, offsetX })
+  }, [])
 
   const stop = useCallback(() => {
     if (rt.current) {
@@ -191,7 +282,6 @@ export function useSilhouetteRush(): SilhouetteRushApi {
     if (!r || r.mode === 'playing') return
     r.renderer.reset()
     r.state = createGame(defaultConfig(), (Date.now() & 0xffffffff) >>> 0)
-    r.alignHold = 0
     r.mode = 'playing'
     setSnap((s) => ({ ...emptySnapshot(s.best), status: 'playing', best: s.best }))
   }, [])
@@ -232,10 +322,6 @@ export function useSilhouetteRush(): SilhouetteRushApi {
         const view = alignmentView(b)
         r.renderer.drawFraming(ctx, r.lastMatte, view, dt, rect.width, rect.height, r.dpr)
 
-        if (view.headOn && view.feetOn) r.alignHold += dt
-        else r.alignHold = 0
-        const hold = Math.min(1, r.alignHold / AUTO_START_HOLD)
-
         setSnap((s) => ({
           ...s,
           status: 'framing',
@@ -244,14 +330,11 @@ export function useSilhouetteRush(): SilhouetteRushApi {
           headAligned: view.headOn,
           feetAligned: view.feetOn,
           framingHint: framingHint(b, view),
-          holdProgress: hold,
           fps: (r.source as { fps?: number }).fps ?? 0,
         }))
 
-        // Real webcam auto-starts after a short aligned hold; demo/test wait for
-        // the explicit button so the framing screen stays put.
-        if (!r.isFake && r.alignHold >= AUTO_START_HOLD) beginPlay()
-
+        // No auto-start: the round begins only when the player clicks 시작
+        // (beginPlay), so nobody is thrown into a round before they're ready.
         r.raf = requestAnimationFrame(loop)
         return
       }
@@ -293,7 +376,7 @@ export function useSilhouetteRush(): SilhouetteRushApi {
 
       r.raf = requestAnimationFrame(loop)
     },
-    [commitGameOver, beginPlay],
+    [commitGameOver],
   )
 
   const begin = useCallback(
@@ -306,6 +389,9 @@ export function useSilhouetteRush(): SilhouetteRushApi {
       setModelProgress(opts?.fake ? 1 : 0)
 
       const source: MaskSource = opts?.fake ? new FakeMaskSource() : new WebcamMaskSource('user')
+      // Seed the source with the restored/last framing so the first frame is
+      // already zoomed the way the player left it.
+      source.setTransform?.(transformRef.current)
 
       if (!opts?.fake) {
         setSnap((s) => ({ ...s, status: 'loading' }))
@@ -363,7 +449,6 @@ export function useSilhouetteRush(): SilhouetteRushApi {
         fakeMatte: null,
         lastMatte: null,
         mode: useFraming ? 'framing' : 'playing',
-        alignHold: 0,
         isFake: !!opts?.fake,
       }
       setSnap((s) => ({
@@ -431,6 +516,17 @@ export function useSilhouetteRush(): SilhouetteRushApi {
         s.setMask(buildPoseMask(pose))
       },
       beginPlay: () => beginPlay(),
+      // Framing-transform hooks so headless verification can prove the slider is
+      // wired to the live pipeline (change zoom → body bounds actually change).
+      setZoom: (z: number) => setZoom(z),
+      setOffsetY: (o: number) => setOffsetY(o),
+      autoFit: () => autoFit(),
+      resetTransform: () => resetTransform(),
+      getTransform: () => ({ ...transformRef.current }),
+      getBounds: () => {
+        const m = rt.current?.source.read()
+        return m ? maskBounds(m) : null
+      },
       setFit: () => {
         const s = rt.current?.source
         if (s instanceof FakeMaskSource) s.setMask(fitMaskForWall())
@@ -466,7 +562,7 @@ export function useSilhouetteRush(): SilhouetteRushApi {
     return () => {
       delete w.__silhouetteRush
     }
-  }, [start, beginPlay])
+  }, [start, beginPlay, setZoom, setOffsetY, autoFit, resetTransform])
 
   return {
     canvasRef,
@@ -480,6 +576,11 @@ export function useSilhouetteRush(): SilhouetteRushApi {
     restart,
     quit,
     getLastMatte,
+    transform,
+    setZoom,
+    setOffsetY,
+    autoFit,
+    resetTransform,
   }
 }
 
