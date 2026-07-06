@@ -5,8 +5,9 @@ import tailwindcss from '@tailwindcss/vite'
 // https://vite.dev/config/
 export default defineConfig({
   plugins: [react(), tailwindcss()],
-  optimizeDeps: {
-    exclude: ['@huggingface/transformers'],
+  // The segmentation worker is an ES module (uses `import`), so emit ES workers.
+  worker: {
+    format: 'es',
   },
   build: {
     target: 'esnext',

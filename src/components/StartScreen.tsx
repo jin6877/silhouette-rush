@@ -118,7 +118,7 @@ export function StartScreen({ best, error, onStart, onDemo }: Props) {
       </div>
 
       <p className="relative z-10 mt-8 text-center text-xs text-mist-500">
-        데스크톱 · 최신 크롬/엣지 권장 · WebGPU 지원 시 더 부드럽게 동작합니다
+        데스크톱 · 최신 크롬/엣지 권장 · GPU 가속 지원 시 더 부드럽게 동작합니다
       </p>
     </div>
   )

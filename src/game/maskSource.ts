@@ -3,7 +3,7 @@
 // verification without a real webcam or ML model.
 
 import { MASK_W, MASK_H, createMask, type Mask } from './masks'
-import { segmentFrame } from './segmentation'
+import { getEngine, type Engine, type SegResult } from './segmentation'
 
 export interface MaskSource {
   start(): Promise<void>
@@ -15,32 +15,73 @@ export interface MaskSource {
   readonly fps?: number
 }
 
-// Processing resolution for MODNet — small enough to stay real-time.
+// Processing resolution — the frame we ship to the worker. Small enough that
+// MediaPipe stays comfortably real-time; 4:3 to match a typical webcam.
 const WORK_W = 256
 const WORK_H = 192
 
+// Temporal smoothing time-constants (seconds). Small = responsive. The mask
+// (used for judgment) is kept snappy; the matte (visual glow) is a touch softer
+// so it flows smoothly between segmentation updates instead of stepping.
+const TAU_MASK = 0.045
+const TAU_MATTE = 0.06
+const BODY_THRESHOLD = 120 // EMA value (0..255) above which a cell counts as body
+
 /**
- * Real webcam source. The frame is drawn mirrored (selfie view) into a small
- * work canvas, segmented with MODNet, and downsampled into the game grid.
- * The camera image never leaves the device.
+ * Real webcam source. Each webcam frame is drawn mirrored (selfie view) into a
+ * small work canvas and shipped to the segmentation worker. We only ever
+ * process the *latest* frame (drop anything that arrives while the worker is
+ * busy) so latency never accumulates, and we temporally smooth the result so
+ * the silhouette flows even between updates. The camera image never leaves the
+ * device.
  */
 export class WebcamMaskSource implements MaskSource {
   private stream: MediaStream | null = null
   private video: HTMLVideoElement | null = null
-  private work: HTMLCanvasElement
+  private work: HTMLCanvasElement | OffscreenCanvas
+  private workCtx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D
   private matte: HTMLCanvasElement
-  private latest: Mask | null = null
+  private engine: Engine | null = null
   private running = false
+  private inFlight = false
+  private timestamp = 0
+  private rafId = 0
+
+  // Segmentation result targets (updated whenever a frame comes back).
+  private targetGrid: Uint8Array | null = null
+  private targetMatte: Uint8Array | null = null
+  private matteW = 0
+  private matteH = 0
+
+  // EMA accumulators + outputs.
+  private gridEMA = new Float32Array(MASK_W * MASK_H)
+  private matteEMA: Float32Array | null = null
+  private matteImage: ImageData | null = null
+  private latest: Mask | null = null
+  private lastAdvance = 0
+
+  // FPS of the segmentation pipeline (updates/sec).
   private frameCount = 0
   private lastFpsT = 0
   private _fps = 0
+
   private readonly facingMode: 'user' | 'environment'
 
   constructor(facingMode: 'user' | 'environment' = 'user') {
     this.facingMode = facingMode
-    this.work = document.createElement('canvas')
-    this.work.width = WORK_W
-    this.work.height = WORK_H
+    // Prefer an OffscreenCanvas (zero-copy `transferToImageBitmap`); fall back
+    // to a regular canvas where OffscreenCanvas isn't available.
+    if (typeof OffscreenCanvas !== 'undefined') {
+      const c = new OffscreenCanvas(WORK_W, WORK_H)
+      this.work = c
+      this.workCtx = c.getContext('2d')!
+    } else {
+      const c = document.createElement('canvas')
+      c.width = WORK_W
+      c.height = WORK_H
+      this.work = c
+      this.workCtx = c.getContext('2d')!
+    }
     this.matte = document.createElement('canvas')
     this.matte.width = WORK_W
     this.matte.height = WORK_H
@@ -48,9 +89,6 @@ export class WebcamMaskSource implements MaskSource {
 
   get matteCanvas() {
     return this.matte
-  }
-  get videoEl() {
-    return this.video
   }
   get fps() {
     return this._fps
@@ -62,6 +100,7 @@ export class WebcamMaskSource implements MaskSource {
         facingMode: this.facingMode,
         width: { ideal: 640 },
         height: { ideal: 480 },
+        frameRate: { ideal: 30 },
       },
       audio: false,
     })
@@ -72,75 +111,141 @@ export class WebcamMaskSource implements MaskSource {
     video.playsInline = true
     await video.play()
     this.video = video
+
+    // Load the segmentation worker + model (emits progress). Throws on failure
+    // so the caller can surface a model-load error.
+    this.engine = await getEngine()
+
     this.running = true
-    // Warm up the model + start the processing loop (does not block the caller).
-    void this.loop()
+    this.lastAdvance = performance.now()
+    this.lastFpsT = performance.now()
+    this.scheduleFrame()
   }
 
-  private async loop() {
-    while (this.running) {
-      const video = this.video
-      if (!video || video.readyState < 2) {
-        await sleep(30)
-        continue
+  /** Feed the worker the latest webcam frame, dropping frames while it is busy. */
+  private scheduleFrame() {
+    const video = this.video
+    if (!this.running || !video) return
+    const onFrame = () => {
+      if (!this.running) return
+      if (this.engine && !this.inFlight && video.readyState >= 2) {
+        void this.processFrame()
       }
-      try {
-        const wctx = this.work.getContext('2d')!
-        // Mirror horizontally for a natural selfie view.
-        wctx.save()
-        wctx.translate(WORK_W, 0)
-        wctx.scale(-1, 1)
-        wctx.drawImage(video, 0, 0, WORK_W, WORK_H)
-        wctx.restore()
-
-        const matte = await segmentFrame(this.work)
-        // Paint alpha matte (cyan-ish) into the matte canvas for rendering.
-        this.paintMatte(matte)
-        this.latest = downsampleToMask(matte)
-      } catch {
-        // Transient errors (e.g. context loss) — skip this frame.
-        await sleep(60)
-      }
-
-      this.frameCount++
-      const now = performance.now()
-      if (now - this.lastFpsT > 500) {
-        this._fps = Math.round((this.frameCount * 1000) / (now - this.lastFpsT))
-        this.frameCount = 0
-        this.lastFpsT = now
-      }
-      // Yield to the event loop so the render RAF stays smooth.
-      await sleep(0)
+      this.scheduleFrame()
+    }
+    const v = video as unknown as {
+      requestVideoFrameCallback?: (cb: () => void) => number
+    }
+    if (typeof v.requestVideoFrameCallback === 'function') {
+      v.requestVideoFrameCallback(onFrame)
+    } else {
+      this.rafId = requestAnimationFrame(onFrame)
     }
   }
 
-  private paintMatte(matte: { data: Uint8Array | Uint8ClampedArray; width: number; height: number }) {
-    const w = matte.width
-    const h = matte.height
-    if (this.matte.width !== w || this.matte.height !== h) {
-      this.matte.width = w
-      this.matte.height = h
+  private async processFrame() {
+    const video = this.video
+    const engine = this.engine
+    if (!video || !engine) return
+    this.inFlight = true
+    try {
+      const ctx = this.workCtx
+      ctx.save()
+      ctx.translate(WORK_W, 0)
+      ctx.scale(-1, 1) // mirror for a natural selfie view
+      ctx.drawImage(video, 0, 0, WORK_W, WORK_H)
+      ctx.restore()
+
+      const bitmap =
+        'transferToImageBitmap' in this.work
+          ? (this.work as OffscreenCanvas).transferToImageBitmap()
+          : await createImageBitmap(this.work as HTMLCanvasElement)
+
+      this.timestamp = Math.max(Math.round(performance.now()), this.timestamp + 1)
+      const res = await engine.segment(bitmap, this.timestamp)
+      if (!this.running) return
+      this.applyResult(res)
+      this.countFps()
+    } catch {
+      // Dropped/failed frame — just skip it.
+    } finally {
+      this.inFlight = false
     }
-    const ctx = this.matte.getContext('2d')!
-    const img = ctx.createImageData(w, h)
-    const src = matte.data
+  }
+
+  private applyResult(res: SegResult) {
+    this.targetGrid = res.grid
+    this.targetMatte = res.matte
+    if (this.matteW !== res.mw || this.matteH !== res.mh || !this.matteEMA) {
+      this.matteW = res.mw
+      this.matteH = res.mh
+      this.matteEMA = new Float32Array(res.mw * res.mh)
+      this.matte.width = res.mw
+      this.matte.height = res.mh
+      this.matteImage = this.matte.getContext('2d')!.createImageData(res.mw, res.mh)
+    }
+  }
+
+  private countFps() {
+    this.frameCount++
+    const now = performance.now()
+    if (now - this.lastFpsT > 500) {
+      this._fps = Math.round((this.frameCount * 1000) / (now - this.lastFpsT))
+      this.frameCount = 0
+      this.lastFpsT = now
+    }
+  }
+
+  /**
+   * Advance the temporal smoothing toward the latest segmentation and repaint
+   * the matte. Called once per render frame (from the game loop) so the
+   * silhouette stays smooth at 60fps even when updates arrive at ~30.
+   */
+  private advance() {
+    const now = performance.now()
+    const dt = Math.min(0.1, Math.max(0, (now - this.lastAdvance) / 1000))
+    this.lastAdvance = now
+    if (!this.targetGrid || !this.targetMatte || !this.matteEMA) return
+
+    const kMask = 1 - Math.exp(-dt / TAU_MASK)
+    const kMatte = 1 - Math.exp(-dt / TAU_MATTE)
+
+    // Grid EMA → thresholded body mask for judgment.
+    const grid = this.targetGrid
+    const gema = this.gridEMA
+    if (!this.latest) this.latest = createMask()
+    const out = this.latest.data
+    for (let i = 0; i < gema.length; i++) {
+      gema[i] += (grid[i] - gema[i]) * kMask
+      out[i] = gema[i] > BODY_THRESHOLD ? 255 : 0
+    }
+
+    // Matte EMA → soft alpha for the neon glow, repainted every frame.
+    const matte = this.targetMatte
+    const mema = this.matteEMA
+    const img = this.matteImage!
     const dst = img.data
-    for (let i = 0; i < w * h; i++) {
-      const a = src[i]
-      dst[i * 4] = 255
-      dst[i * 4 + 1] = 255
-      dst[i * 4 + 2] = 255
-      dst[i * 4 + 3] = a
+    for (let i = 0; i < mema.length; i++) {
+      mema[i] += (matte[i] - mema[i]) * kMatte
+      const j = i * 4
+      dst[j] = 255
+      dst[j + 1] = 255
+      dst[j + 2] = 255
+      dst[j + 3] = mema[i]
     }
-    ctx.putImageData(img, 0, 0)
+    this.matte.getContext('2d')!.putImageData(img, 0, 0)
   }
 
   read(): Mask | null {
+    if (!this.running) return this.latest
+    this.advance()
     return this.latest
   }
 
   stop(): void {
     this.running = false
+    if (this.rafId) cancelAnimationFrame(this.rafId)
+    this.rafId = 0
     this.stream?.getTracks().forEach((t) => t.stop())
     if (this.video) {
       this.video.srcObject = null
@@ -148,30 +253,11 @@ export class WebcamMaskSource implements MaskSource {
     }
     this.stream = null
     this.latest = null
+    this.targetGrid = null
+    this.targetMatte = null
+    this.gridEMA.fill(0)
+    this.matteEMA = null
   }
-}
-
-function sleep(ms: number) {
-  return new Promise<void>((r) => setTimeout(r, ms))
-}
-
-/** Downsample an alpha matte to the fixed game grid, thresholding to 0/255. */
-function downsampleToMask(matte: {
-  data: Uint8Array | Uint8ClampedArray
-  width: number
-  height: number
-}): Mask {
-  const out = createMask(MASK_W, MASK_H)
-  const { data, width: sw, height: sh } = matte
-  for (let gy = 0; gy < MASK_H; gy++) {
-    const sy = Math.min(sh - 1, Math.floor(((gy + 0.5) / MASK_H) * sh))
-    for (let gx = 0; gx < MASK_W; gx++) {
-      const sx = Math.min(sw - 1, Math.floor(((gx + 0.5) / MASK_W) * sw))
-      const a = data[sy * sw + sx]
-      out.data[gy * MASK_W + gx] = a > 110 ? 255 : 0
-    }
-  }
-  return out
 }
 
 /**

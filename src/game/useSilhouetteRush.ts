@@ -9,7 +9,7 @@ import {
 } from './engine'
 import { GameRenderer } from './render'
 import { WebcamMaskSource, FakeMaskSource, type MaskSource } from './maskSource'
-import { onModelProgress, getDevice, getEngine } from './segmentation'
+import { onModelProgress, getDevice } from './segmentation'
 import {
   MASK_W,
   MASK_H,
@@ -215,6 +215,8 @@ export function useSilhouetteRush(): SilhouetteRushApi {
 
       if (!opts?.fake) {
         setSnap((s) => ({ ...s, status: 'loading' }))
+        // start() acquires the camera AND loads the segmentation worker/model
+        // (driving the progress bar). Classify the failure for a helpful message.
         try {
           await source.start()
         } catch (e) {
@@ -224,21 +226,16 @@ export function useSilhouetteRush(): SilhouetteRushApi {
           } else if (name === 'NotFoundError' || name === 'OverconstrainedError') {
             setError('카메라를 찾을 수 없어요. 웹캠을 연결한 뒤 다시 시도해 주세요.')
           } else {
-            setError('카메라를 사용할 수 없어요. HTTPS 환경과 브라우저 지원을 확인해 주세요.')
+            setError('실루엣 인식 엔진을 불러오지 못했어요. 네트워크(카메라·모델 CDN)를 확인해 주세요.')
           }
           setSnap((s) => ({ ...s, status: 'idle' }))
           source.stop()
           return
         }
-        // Preload the segmentation model (progress bar) before play begins.
         try {
-          await getEngine()
           setDevice(await getDevice())
         } catch {
-          setError('세그멘테이션 모델을 불러오지 못했어요. 네트워크를 확인해 주세요.')
-          setSnap((s) => ({ ...s, status: 'idle' }))
-          source.stop()
-          return
+          /* device label is best-effort */
         }
       } else {
         await source.start()

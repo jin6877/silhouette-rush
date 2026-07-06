@@ -1,28 +1,35 @@
-// Real-time human silhouette segmentation using @huggingface/transformers.
-// Reuses the nukki-studio engine-loading pattern (WebGPU with WASM fallback +
-// download-progress events) but swaps the heavy RMBG image model for MODNet,
-// a lightweight portrait-matting model designed for real-time video. We feed
-// small frames (~256px) so it runs at interactive frame-rates.
+// Segmentation engine: owns the segmentation Web Worker and the model download.
+//
+// We replaced the heavy MODNet matting model (run on the main thread via
+// transformers.js) with MediaPipe's Selfie Segmenter, a video-optimized model
+// that runs at 30-60fps in a background worker. This module only handles the
+// one-time setup — downloading the model with real progress, spinning up the
+// worker, and exposing a `segment()` call that ships a frame to the worker and
+// resolves with the resulting masks. Inference itself never touches this thread.
 
-import {
-  AutoModel,
-  AutoProcessor,
-  RawImage,
-  env,
-  type PreTrainedModel,
-  type Processor,
-} from '@huggingface/transformers'
+// Model + wasm are fetched from CDNs (no server, no API keys) — matches the
+// prior static-deploy story. Version is pinned to the installed package below.
+const TASKS_VISION_VERSION = '0.10.35'
+const WASM_BASE = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${TASKS_VISION_VERSION}/wasm`
+// Selfie Segmenter (general, 256x256) — tiny & tuned for real-time video.
+const MODEL_URL =
+  'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite'
 
-env.allowLocalModels = false
+export type EngineDevice = 'gpu' | 'cpu'
 
-const MODEL_ID = 'Xenova/modnet'
+export interface SegResult {
+  /** Soft occupancy grid at game resolution (MASK_W x MASK_H), 0..255. */
+  grid: Uint8Array
+  /** Full-res alpha matte for the glow, mw x mh, 0..255. */
+  matte: Uint8Array
+  mw: number
+  mh: number
+}
 
-export type EngineDevice = 'webgpu' | 'wasm'
-
-interface Engine {
-  model: PreTrainedModel
-  processor: Processor
+export interface Engine {
   device: EngineDevice
+  /** Ship one frame to the worker; resolves with masks (or rejects on drop). */
+  segment(bitmap: ImageBitmap, timestamp: number): Promise<SegResult>
 }
 
 type ProgressListener = (progress: number) => void
@@ -39,61 +46,112 @@ function emitProgress(p: number) {
   for (const listener of progressListeners) listener(p)
 }
 
-async function detectWebGPU(): Promise<boolean> {
-  const gpu = (navigator as unknown as { gpu?: { requestAdapter(): Promise<unknown> } }).gpu
-  if (!gpu) return false
-  try {
-    const adapter = await gpu.requestAdapter()
-    return adapter != null
-  } catch {
-    return false
+/** Download a binary asset while reporting byte-level progress via `onFraction`. */
+async function fetchWithProgress(
+  url: string,
+  onFraction: (f: number) => void,
+): Promise<ArrayBuffer> {
+  const res = await fetch(url)
+  if (!res.ok) throw new Error(`model fetch failed: ${res.status}`)
+  const total = Number(res.headers.get('content-length')) || 0
+  if (!res.body || !total) {
+    // No streaming/length info — fall back to a plain download.
+    return res.arrayBuffer()
+  }
+  const reader = res.body.getReader()
+  const chunks: Uint8Array[] = []
+  let loaded = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    chunks.push(value)
+    loaded += value.length
+    onFraction(Math.min(1, loaded / total))
+  }
+  const out = new Uint8Array(loaded)
+  let offset = 0
+  for (const c of chunks) {
+    out.set(c, offset)
+    offset += c.length
+  }
+  return out.buffer
+}
+
+class WorkerEngine implements Engine {
+  readonly device: EngineDevice
+  private worker: Worker
+  private pending = new Map<
+    number,
+    { resolve: (r: SegResult) => void; reject: (e: Error) => void }
+  >()
+  private nextId = 1
+
+  constructor(worker: Worker, device: EngineDevice) {
+    this.worker = worker
+    this.device = device
+    this.worker.onmessage = (e: MessageEvent) => {
+      const msg = e.data
+      if (msg?.type === 'result') {
+        const p = this.pending.get(msg.id)
+        if (p) {
+          this.pending.delete(msg.id)
+          p.resolve({ grid: msg.grid, matte: msg.matte, mw: msg.mw, mh: msg.mh })
+        }
+      } else if (msg?.type === 'frameError') {
+        const p = this.pending.get(msg.id)
+        if (p) {
+          this.pending.delete(msg.id)
+          p.reject(new Error('frame dropped'))
+        }
+      }
+    }
+  }
+
+  segment(bitmap: ImageBitmap, timestamp: number): Promise<SegResult> {
+    const id = this.nextId++
+    return new Promise<SegResult>((resolve, reject) => {
+      this.pending.set(id, { resolve, reject })
+      this.worker.postMessage({ type: 'frame', id, bitmap, timestamp }, [bitmap])
+    })
   }
 }
 
 async function loadEngine(): Promise<Engine> {
-  const files = new Map<string, { loaded: number; total: number }>()
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const progress_callback = (item: any) => {
-    if (item?.status === 'progress' && item.total) {
-      files.set(item.file, { loaded: item.loaded, total: item.total })
-      let loaded = 0
-      let total = 0
-      for (const f of files.values()) {
-        loaded += f.loaded
-        total += f.total
+  const worker = new Worker(new URL('./segWorker.ts', import.meta.url), { type: 'module' })
+
+  // Model download → real byte progress mapped to 0..0.55 of the bar.
+  const modelBuffer = await fetchWithProgress(MODEL_URL, (f) => emitProgress(f * 0.55))
+
+  // Wasm fetch + delegate compile has no granular progress; gently creep the
+  // bar from 0.55 toward 0.95 so it never looks frozen on the first load.
+  let creep = 0.55
+  const creepTimer = setInterval(() => {
+    creep = Math.min(0.95, creep + (0.95 - creep) * 0.12)
+    emitProgress(creep)
+  }, 140)
+
+  const device = await new Promise<EngineDevice>((resolve, reject) => {
+    const onInit = (e: MessageEvent) => {
+      const msg = e.data
+      if (msg?.type === 'ready') {
+        worker.removeEventListener('message', onInit)
+        resolve(msg.device as EngineDevice)
+      } else if (msg?.type === 'error') {
+        worker.removeEventListener('message', onInit)
+        reject(new Error(msg.message || 'segmenter init failed'))
       }
-      if (total > 0) emitProgress(Math.min(0.99, loaded / total))
     }
-  }
-
-  const preferWebGPU = await detectWebGPU()
-  let device: EngineDevice = preferWebGPU ? 'webgpu' : 'wasm'
-
-  let model: PreTrainedModel
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    model = await AutoModel.from_pretrained(MODEL_ID, {
-      device,
-      dtype: 'fp32',
-      progress_callback,
-    } as any)
-  } catch (err) {
-    if (device === 'wasm') throw err
-    device = 'wasm'
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    model = await AutoModel.from_pretrained(MODEL_ID, {
-      device,
-      dtype: 'fp32',
-      progress_callback,
-    } as any)
-  }
-
-  const processor = await AutoProcessor.from_pretrained(MODEL_ID, {
-    progress_callback,
+    worker.addEventListener('message', onInit)
+    worker.postMessage({ type: 'init', modelBuffer, wasmBase: WASM_BASE }, [modelBuffer])
+  }).catch((err) => {
+    clearInterval(creepTimer)
+    worker.terminate()
+    throw err
   })
 
+  clearInterval(creepTimer)
   emitProgress(1)
-  return { model, processor, device }
+  return new WorkerEngine(worker, device)
 }
 
 export function getEngine(): Promise<Engine> {
@@ -108,27 +166,4 @@ export function getEngine(): Promise<Engine> {
 
 export async function getDevice(): Promise<EngineDevice> {
   return (await getEngine()).device
-}
-
-/**
- * Runs MODNet on `input` (a canvas holding the current, already-mirrored video
- * frame) and returns a single-channel alpha matte as a RawImage at the input's
- * resolution. High alpha = person.
- */
-export async function segmentFrame(input: HTMLCanvasElement): Promise<RawImage> {
-  const { model, processor } = await getEngine()
-  const ctx = input.getContext('2d', { willReadFrequently: true })!
-  const { data, width, height } = ctx.getImageData(0, 0, input.width, input.height)
-  const image = new RawImage(new Uint8ClampedArray(data), width, height, 4)
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const { pixel_values } = await (processor as any)(image)
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const out: any = await model({ input: pixel_values })
-  let tensor = out.output ?? out.alpha ?? Object.values(out)[0]
-  // Some builds return logits; MODNet matte is already 0..1.
-  const matte = await RawImage.fromTensor(tensor[0].mul(255).to('uint8')).resize(
-    image.width,
-    image.height,
-  )
-  return matte
 }
