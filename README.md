@@ -10,7 +10,7 @@
   <img alt="Vite" src="https://img.shields.io/badge/Vite-8-a855f7?logo=vite&logoColor=white" />
   <img alt="Tailwind CSS" src="https://img.shields.io/badge/Tailwind-v4-ff2e9a?logo=tailwindcss&logoColor=white" />
   <img alt="MediaPipe" src="https://img.shields.io/badge/MediaPipe-Selfie%20Segmenter-b6ff3a?logo=google&logoColor=white" />
-  <img alt="Web Worker" src="https://img.shields.io/badge/Web%20Worker-off--thread-34e9ff" />
+  <img alt="WebGL" src="https://img.shields.io/badge/WebGL-GPU%20delegate-34e9ff" />
 </p>
 
 ## 🔗 라이브 데모
@@ -31,7 +31,7 @@
 
 ## ✨ 주요 기능
 
-- 🧍 **실시간 인체 세그멘테이션** — [MediaPipe **Selfie Segmenter**](https://ai.google.dev/edge/mediapipe/solutions/vision/image_segmenter)를 **Web Worker**에서 구동해 실루엣 마스크를 추출. 영상 전용 경량 모델이라 브라우저에서 30–60fps, GPU(WebGL) 우선·CPU 폴백. 추론이 **메인 스레드를 막지 않아** 게임은 항상 60fps로 렌더됩니다.
+- 🧍 **실시간 인체 세그멘테이션** — [MediaPipe **Selfie Segmenter**](https://ai.google.dev/edge/mediapipe/solutions/vision/image_segmenter)로 실루엣 마스크를 추출. 영상 전용 경량 모델이라 브라우저에서 30–60fps, **GPU(WebGL) 델리게이트 우선·CPU 폴백**. 추론은 메인 스레드에서 돌지만 모델이 가볍고 **프레임 드롭 + 마스크 시간 보간(EMA)**으로 게임은 항상 60fps로 렌더됩니다.
 - 🎯 **픽셀 겹침 판정** — 벽의 채워진 픽셀과 플레이어 실루엣의 **겹침 비율**로 통과/충돌을 판정. 사람은 완벽히 못 맞추니 임계치는 관대하게.
 - 🕺 **8종 포즈 구멍** — 차렷·양팔 벌리기·만세·한 팔 번쩍·옆으로 기울이기·점프 스타·한쪽 다리 옆차기·웅크리기. 깔끔한 실루엣 도형으로 재현 가능한 난이도.
 - 💯 **점수 · 콤보 · 하트** — 통과할 때마다 콤보 배수가 붙고, 라운드가 오를수록 난이도 상승.
@@ -43,19 +43,19 @@
 ## 🧠 어떻게 동작하나
 
 ```
-     [메인 스레드 · 60fps]                       [Web Worker · 추론 전용]
-웹캠 프레임 ─(rVFC로 최신 1장만, 좌우반전 256×192)─▶ 전송 ─▶ MediaPipe Selfie 세그멘테이션
+                    [메인 스레드 · 렌더 60fps]
+웹캠 프레임 ─(rVFC로 최신 1장만, 좌우반전 256×192)─▶ MediaPipe Selfie 세그멘테이션(GPU/WebGL)
       │                        ▲                                   │
-      │                        │  워커가 바쁘면 프레임 드롭          ▼
-      │                    최신 마스크 폴링 ◀──── 알파 마스크 + 128×96 게임 그리드
+      │                        │  추론 중이면 프레임 드롭            ▼
+      │                    최신 마스크 ◀───────── 알파 마스크 + 128×96 게임 그리드
       ▼                        │
   네온 실루엣 렌더링 ◀── 마스크 시간 보간(EMA)으로 60fps 부드럽게 채움
                                │
    벽 마스크(포즈 구멍) ─── 겹침 픽셀 판정 ─── 통과 / 충돌 · 점수 · 콤보 · 하트
 ```
 
-- **추론을 Web Worker로 분리**해 게임 렌더 루프(60fps)를 절대 막지 않습니다. 메인 스레드는 최신 프레임만 워커에 넘기고 결과 마스크를 폴링합니다.
-- **최신 프레임만 처리(프레임 드롭)** — `requestVideoFrameCallback`으로 매 웹캠 프레임을 받되, 워커가 처리 중이면 건너뛰어 지연이 쌓이지 않습니다.
+- **메인 스레드에서 GPU(WebGL) 델리게이트로 추론**합니다. MediaPipe wasm 로더는 워커의 `importScripts`에 의존해 ES-module 워커에선 `ModuleFactory not set`으로 실패하는데, 메인 스레드로 옮겨 이 문제를 원천 제거했습니다. 모델이 가벼워 렌더 루프를 실질적으로 막지 않고, GPU 델리게이트도 여기서 안정적으로 붙습니다.
+- **최신 프레임만 처리(프레임 드롭)** — `requestVideoFrameCallback`으로 매 웹캠 프레임을 받되, 이전 추론이 진행 중이면 건너뛰어 지연이 쌓이지 않습니다.
 - **마스크 시간 보간(EMA)** — 세그멘테이션 업데이트 사이를 지수 이동평균으로 메꿔, 업데이트가 드물어도 실루엣이 끊기지 않고 부드럽게 이어집니다. (판정용 마스크는 반응성 위주의 짧은 시정수.)
 - **입력 소스를 인터페이스로 분리**했습니다. 게임 로직은 `MaskSource`(실제 웹캠) 또는 `FakeMaskSource`(주입형) 어느 쪽으로도 구동됩니다.
 - **판정·점수·라운드·게임오버 로직은 DOM/모델 없는 순수 모듈**(`src/game/masks.ts`, `src/game/engine.ts`)이라, 합성 마스크로 자동 검증이 가능합니다.
@@ -68,8 +68,8 @@ npx tsx verify/verify.ts   # 구멍에 맞는 마스크=통과, 어긋난 마스
 
 - **React 19** + **TypeScript** + **Vite 8**
 - **Tailwind CSS v4** (`@tailwindcss/vite`)
-- **@mediapipe/tasks-vision** (Selfie Segmenter, Web Worker + GPU/WASM, CDN 로드)
-- Canvas 2D 렌더링 · Web Worker · `requestVideoFrameCallback` · `getUserMedia` · `localStorage`(최고 점수)
+- **@mediapipe/tasks-vision** (Selfie Segmenter, 메인 스레드 GPU(WebGL)/WASM, CDN 로드)
+- Canvas 2D 렌더링 · `requestVideoFrameCallback` · `getUserMedia` · `localStorage`(최고 점수)
 
 ## 💻 로컬 실행
 
@@ -92,8 +92,7 @@ src/
 ├─ game/
 │  ├─ masks.ts             # 마스크 유틸 + 포즈 구멍 라이브러리 + 겹침 판정(순수)
 │  ├─ engine.ts            # 게임 상태 머신: 벽 접근·판정·점수·콤보·하트(순수)
-│  ├─ segmentation.ts      # 세그멘테이션 워커 + 모델 다운로드(진행률) 관리
-│  ├─ segWorker.ts         # Web Worker: MediaPipe Selfie Segmenter 추론(GPU→CPU)
+│  ├─ segmentation.ts      # MediaPipe Selfie Segmenter 로드·추론(메인 스레드 GPU→CPU) + 모델 다운로드(진행률)
 │  ├─ maskSource.ts        # MaskSource 인터페이스 · WebcamMaskSource(프레임드롭+EMA) · FakeMaskSource
 │  ├─ render.ts            # 네온 무대·원근 벽·실루엣·파티클 캔버스 렌더러
 │  ├─ scoreCard.ts         # 공유용 결과 카드 캔버스 생성

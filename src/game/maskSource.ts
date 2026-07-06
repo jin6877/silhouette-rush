@@ -15,7 +15,7 @@ export interface MaskSource {
   readonly fps?: number
 }
 
-// Processing resolution — the frame we ship to the worker. Small enough that
+// Processing resolution — the frame we hand to the segmenter. Small enough that
 // MediaPipe stays comfortably real-time; 4:3 to match a typical webcam.
 const WORK_W = 256
 const WORK_H = 192
@@ -29,11 +29,11 @@ const BODY_THRESHOLD = 120 // EMA value (0..255) above which a cell counts as bo
 
 /**
  * Real webcam source. Each webcam frame is drawn mirrored (selfie view) into a
- * small work canvas and shipped to the segmentation worker. We only ever
- * process the *latest* frame (drop anything that arrives while the worker is
- * busy) so latency never accumulates, and we temporally smooth the result so
- * the silhouette flows even between updates. The camera image never leaves the
- * device.
+ * small work canvas and handed to the segmenter (which runs on the main thread).
+ * We only ever process the *latest* frame (drop anything that arrives while an
+ * inference is in flight) so latency never accumulates, and we temporally smooth
+ * the result so the silhouette flows even between updates. The camera image
+ * never leaves the device.
  */
 export class WebcamMaskSource implements MaskSource {
   private stream: MediaStream | null = null
@@ -112,8 +112,8 @@ export class WebcamMaskSource implements MaskSource {
     await video.play()
     this.video = video
 
-    // Load the segmentation worker + model (emits progress). Throws on failure
-    // so the caller can surface a model-load error.
+    // Load the segmenter + model on the main thread (emits progress). Throws on
+    // failure so the caller can surface a model-load error.
     this.engine = await getEngine()
 
     this.running = true
@@ -122,7 +122,7 @@ export class WebcamMaskSource implements MaskSource {
     this.scheduleFrame()
   }
 
-  /** Feed the worker the latest webcam frame, dropping frames while it is busy. */
+  /** Segment the latest webcam frame, dropping frames while one is in flight. */
   private scheduleFrame() {
     const video = this.video
     if (!this.running || !video) return
