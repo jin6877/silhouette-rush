@@ -9,10 +9,14 @@ import {
   judge,
   maskArea,
   maskBounds,
+  normalizePlayer,
+  captureCalibration,
   BODY_FRAME,
   MASK_W,
   MASK_H,
   type Mask,
+  type Calibration,
+  type MaskBounds,
 } from '../src/game/masks'
 import {
   createGame,
@@ -41,6 +45,27 @@ function blockMask(x0: number, y0: number, x1: number, y1: number): Mask {
     }
   }
   return m
+}
+
+// Inverse of the judgment warp: place a canonical pose mask into the camera at
+// `cal`, i.e. simulate a player who appears small / off to one side while doing
+// that pose. warpToCanonical(placeInCamera(x, cal), cal) ≈ x, so this lets us
+// verify the body-relative normalization end to end.
+function placeInCamera(src: Mask, cal: Calibration): Mask {
+  const out = createMask()
+  const s = (BODY_FRAME.feetY - BODY_FRAME.headY) / Math.max(1e-3, cal.bottom - cal.top)
+  for (let oy = 0; oy < MASK_H; oy++) {
+    const nY = BODY_FRAME.headY + ((oy + 0.5) / MASK_H - cal.top) * s
+    const sy = Math.floor(nY * MASK_H)
+    if (sy < 0 || sy >= MASK_H) continue
+    for (let ox = 0; ox < MASK_W; ox++) {
+      const nX = 0.5 + ((ox + 0.5) / MASK_W - cal.centerX) * s
+      const sx = Math.floor(nX * MASK_W)
+      if (sx < 0 || sx >= MASK_W) continue
+      out.data[oy * MASK_W + ox] = src.data[sy * MASK_W + sx]
+    }
+  }
+  return out
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +256,79 @@ console.log('10) 난이도 곡선: 판정 관용도가 라운드에 따라 빡�
     if (!r.pass) allPass = false
   }
   assert(allPass, '가장 빡센 설정에서도 모든 포즈의 정확한 핏은 통과')
+}
+
+// ---------------------------------------------------------------------------
+console.log('11) 몸-상대 정규화: 작게/구석에 있어도 포즈만 맞으면 통과, 틀리면 충돌')
+{
+  // Small / off-centre bodies that still sit fully inside the camera frame.
+  const placements: { name: string; cal: Calibration }[] = [
+    { name: '작게 중앙', cal: { top: 0.3, bottom: 0.74, centerX: 0.5 } },
+    { name: '작고 왼쪽 구석', cal: { top: 0.24, bottom: 0.66, centerX: 0.3 } },
+    { name: '작고 오른쪽 아래', cal: { top: 0.42, bottom: 0.9, centerX: 0.68 } },
+  ]
+  for (const pl of placements) {
+    let allPass = true
+    let worstFill = 1
+    for (const pose of POSES) {
+      const wall = buildWallMask(pose)
+      // A correct fit for `pose`, but appearing at the player's small/off-centre
+      // camera placement instead of filling the frame.
+      const cam = placeInCamera(erodeMask(buildPoseMask(pose), 1), pl.cal)
+      const aligned = normalizePlayer(cam, pl.cal)
+      const r = judge(wall, aligned)
+      if (!r.pass) allPass = false
+      worstFill = Math.min(worstFill, r.fillRatio)
+    }
+    assert(allPass, `[${pl.name}] 모든 포즈의 올바른 핏이 통과 (최저 채움 ${(worstFill * 100).toFixed(0)}%)`)
+
+    // Same placement, wrong pose (T-pose body against a 차렷 wall) → collides.
+    const standWall = buildWallMask(POSES[0])
+    const wrongCam = placeInCamera(erodeMask(buildPoseMask(POSES[1]), 2), pl.cal)
+    const wrong = judge(standWall, normalizePlayer(wrongCam, pl.cal))
+    assert(!wrong.pass, `[${pl.name}] 틀린 포즈는 충돌 (충돌 ${(wrong.collisionRatio * 100).toFixed(0)}%)`)
+  }
+
+  // Without calibration the normalization is identity (legacy raw judgment): a
+  // small off-centre body that does NOT fill the frame fails, proving the
+  // calibration is what makes size/position independence work.
+  const wall = buildWallMask(POSES[0])
+  const smallRaw = placeInCamera(erodeMask(buildPoseMask(POSES[0]), 2), { top: 0.4, bottom: 0.65, centerX: 0.3 })
+  assert(!judge(wall, normalizePlayer(smallRaw, null)).pass, '캘리브레이션 없으면 작은 몸은 통과 못함(정규화가 핵심임을 확인)')
+}
+
+// ---------------------------------------------------------------------------
+console.log('12) 캘리브레이션 후 작고 치우친 몸으로 20회 완주(엔진 통합)')
+{
+  const cal: Calibration = { top: 0.3, bottom: 0.74, centerX: 0.34 } // 작고 왼쪽
+  const state = createGame(defaultConfig(), 321, cal)
+  const dt = 1 / 60
+  let frames = 0
+  while (state.phase !== 'gameover' && frames < 60 * 120) {
+    const player = state.wall ? placeInCamera(erodeMask(state.wall.holeMask, 2), cal) : null
+    stepGame(state, player, dt)
+    frames++
+    if (state.passes >= 20) break
+  }
+  assert(state.passes >= 20, `작고 치우친 몸 + 캘리브레이션으로 20회 통과 (통과 ${state.passes}, 실패 ${state.fails})`)
+  assert(state.fails === 0, `완주 중 실패 없음 (실패 ${state.fails})`)
+}
+
+// ---------------------------------------------------------------------------
+console.log('13) captureCalibration: 표본 평균 + 잘림 감지')
+{
+  const s1: MaskBounds = { present: true, top: 0.2, bottom: 0.9, left: 0.4, right: 0.6, centerX: 0.5, area: 0.1 }
+  const s2: MaskBounds = { present: true, top: 0.24, bottom: 0.94, left: 0.42, right: 0.62, centerX: 0.54, area: 0.1 }
+  const cal = captureCalibration([s1, s2])
+  assert(
+    Math.abs(cal.top - 0.22) < 1e-6 && Math.abs(cal.bottom - 0.92) < 1e-6 && Math.abs(cal.centerX - 0.52) < 1e-6,
+    `표본 평균: top=${cal.top.toFixed(2)} bottom=${cal.bottom.toFixed(2)} cx=${cal.centerX.toFixed(2)}`,
+  )
+  // Cut-off detection: a body whose feet reach the frame bottom is flagged.
+  const cutFeet = maskBounds(blockMask(0.4, 0.3, 0.6, 1.0))
+  assert(cutFeet.bottom >= 1 - 0.02, `발 잘림 감지: bottom=${cutFeet.bottom.toFixed(2)}`)
+  const cutHead = maskBounds(blockMask(0.4, 0.0, 0.6, 0.7))
+  assert(cutHead.top <= 0.02, `머리 잘림 감지: top=${cutHead.top.toFixed(2)}`)
 }
 
 console.log('')

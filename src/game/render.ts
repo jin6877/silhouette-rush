@@ -3,14 +3,21 @@
 // forced perspective), and pass/fail particle effects. Pure drawing — reads
 // game state and the player matte, never mutates game logic.
 
-import { dilateMask, BODY_FRAME, type Mask } from './masks'
+import { dilateMask, BODY_FRAME, type Mask, type Calibration } from './masks'
 import type { GameState, GameEvent } from './engine'
 
-/** What the framing screen needs from the renderer each frame. */
+/**
+ * What the framing screen needs from the renderer each frame. The guide lines
+ * now SNAP to the player's detected head-top / feet-bottom (rather than asking
+ * the body to reach fixed lines), and turn red when the body is cut off by the
+ * camera frame edge.
+ */
 export interface FramingView {
   present: boolean
-  headOn: boolean
-  feetOn: boolean
+  top: number // normalized detected head-top
+  bottom: number // normalized detected feet-bottom
+  headCut: boolean
+  feetCut: boolean
 }
 
 const SPRITE_W = 384
@@ -113,8 +120,6 @@ export class GameRenderer {
 
     this.drawBackground(ctx, stage, cssW, cssH)
     this.drawPlayer(ctx, state, matte, stage)
-    // Faint alignment guides stay up during play so the player keeps their frame.
-    this.drawGuides(ctx, stage, { headOn: false, feetOn: false, prominent: false })
     if (state.wall) this.drawWall(ctx, state, stage)
     this.drawParticles(ctx, dt)
 
@@ -191,13 +196,23 @@ export class GameRenderer {
       if (state.live.fitting) color = '182,255,58'
       else if (state.live.present && state.live.collisionRatio > 0.28) color = '255,46,154'
     }
-    drawSilhouette(ctx, matte, stage, color)
+    if (state.calibration) {
+      // Body-relative view: a dim ghost shows where you actually are in the
+      // camera, and the bright silhouette is your body mapped into the arena
+      // frame (exactly what judgment sees) so it lines up with the hole.
+      drawSilhouette(ctx, matte, stage, '128,150,210', 0.2)
+      drawSilhouetteCalibrated(ctx, matte, state.calibration, stage, color)
+    } else {
+      drawSilhouette(ctx, matte, stage, color, 1)
+    }
   }
 
   /**
-   * Framing screen: live silhouette + prominent head/feet alignment lines. No
-   * game state — used before the round starts so the player can line their body
-   * up with the exact frame the pose holes are drawn in.
+   * Framing screen: live silhouette + guide lines that SNAP to the player's own
+   * detected head-top / feet-bottom. The lines are pure viewfinder feedback ("이게
+   * 네 머리/발 위치야"); they turn red when the body is cut off by the frame edge.
+   * All instructions and controls live OUTSIDE the viewport (side/bottom panel),
+   * so nothing floats over the body.
    */
   drawFraming(
     ctx: CanvasRenderingContext2D,
@@ -214,90 +229,63 @@ export class GameRenderer {
     ctx.clearRect(0, 0, cssW, cssH)
     const stage = fitStage(cssW, cssH)
     this.drawBackground(ctx, stage, cssW, cssH)
-    // Silhouette turns lime once fully aligned, cyan otherwise.
-    const color = view.headOn && view.feetOn ? '182,255,58' : '34,233,255'
-    if (matte && matte.width > 0) drawSilhouette(ctx, matte, stage, color)
-    this.drawGuides(ctx, stage, {
-      headOn: view.headOn,
-      feetOn: view.feetOn,
-      prominent: true,
-    })
+    const cut = view.headCut || view.feetCut
+    const color = !view.present ? '34,233,255' : cut ? '255,86,140' : '182,255,58'
+    if (matte && matte.width > 0) drawSilhouette(ctx, matte, stage, color, 1)
+    if (view.present) this.drawFramingGuides(ctx, stage, view)
     ctx.restore()
   }
 
   /**
-   * Head / feet / center alignment lines, drawn at the exact normalized frame
-   * the pose holes assume (`BODY_FRAME`). `prominent` = bright with labels for
-   * the framing step; otherwise a faint dashed overlay for in-game.
+   * Head / feet guide lines snapped to the detected body. Green when the body is
+   * fully inside the frame, red at whichever edge is cut off.
    */
-  private drawGuides(
-    ctx: CanvasRenderingContext2D,
-    stage: StageRect,
-    style: { headOn: boolean; feetOn: boolean; prominent: boolean },
-  ) {
-    const yHead = stage.y + BODY_FRAME.headY * stage.h
-    const yFeet = stage.y + Math.min(BODY_FRAME.feetY * stage.h, stage.h - 2)
-    const xC = stage.x + stage.w / 2
-    const { prominent } = style
+  private drawFramingGuides(ctx: CanvasRenderingContext2D, stage: StageRect, view: FramingView) {
+    const yHead = stage.y + Math.max(2, view.top * stage.h)
+    const yFeet = stage.y + Math.min(view.bottom * stage.h, stage.h - 2)
 
     ctx.save()
     ctx.beginPath()
     roundRect(ctx, stage.x, stage.y, stage.w, stage.h, 18)
     ctx.clip()
 
-    // Center vertical (left/right alignment) — always subtle.
-    ctx.setLineDash([2, 11])
-    ctx.lineWidth = 1.5
-    ctx.strokeStyle = `rgba(216,199,240,${prominent ? 0.3 : 0.1})`
-    ctx.beginPath()
-    ctx.moveTo(xC, stage.y + 8)
-    ctx.lineTo(xC, stage.y + stage.h - 8)
-    ctx.stroke()
-    ctx.setLineDash([])
-
-    const line = (y: number, on: boolean, label: string) => {
-      const rgb = on ? '182,255,58' : prominent ? '34,233,255' : '216,199,240'
-      const alpha = prominent ? (on ? 0.95 : 0.8) : 0.18
+    const line = (y: number, cut: boolean, label: string) => {
+      const rgb = cut ? '255,86,140' : '182,255,58'
       ctx.save()
-      ctx.setLineDash(prominent ? [] : [7, 9])
-      ctx.lineWidth = prominent ? (on ? 3 : 2.5) : 1.5
-      ctx.strokeStyle = `rgba(${rgb},${alpha})`
-      if (prominent) {
-        ctx.shadowColor = `rgba(${rgb},0.85)`
-        ctx.shadowBlur = 12
-      }
+      ctx.lineWidth = 3
+      ctx.strokeStyle = `rgba(${rgb},0.95)`
+      ctx.shadowColor = `rgba(${rgb},0.85)`
+      ctx.shadowBlur = 12
       ctx.beginPath()
       ctx.moveTo(stage.x + 6, y)
       ctx.lineTo(stage.x + stage.w - 6, y)
       ctx.stroke()
       ctx.restore()
 
-      if (!prominent) return
-      // Label chip, kept inside the stage.
       ctx.save()
       ctx.font = '700 13px "Pretendard Variable", system-ui, sans-serif'
       ctx.textBaseline = 'middle'
       ctx.textAlign = 'left'
-      const text = on ? `${label} ✓` : label
+      const text = cut ? `${label} · 잘림!` : label
       const padX = 9
       const chipH = 24
       const chipW = ctx.measureText(text).width + padX * 2
       const chipX = stage.x + 14
       const chipY = Math.min(Math.max(y, stage.y + chipH / 2 + 6), stage.y + stage.h - chipH / 2 - 6)
-      ctx.fillStyle = on ? 'rgba(24,44,8,0.85)' : 'rgba(16,8,30,0.85)'
+      ctx.fillStyle = cut ? 'rgba(46,10,24,0.9)' : 'rgba(24,44,8,0.85)'
       roundRect(ctx, chipX, chipY - chipH / 2, chipW, chipH, 12)
       ctx.fill()
       ctx.lineWidth = 1.5
       ctx.strokeStyle = `rgba(${rgb},0.9)`
       roundRect(ctx, chipX, chipY - chipH / 2, chipW, chipH, 12)
       ctx.stroke()
-      ctx.fillStyle = on ? '#e8ffc8' : '#eaf6ff'
+      ctx.fillStyle = cut ? '#ffd8e4' : '#e8ffc8'
       ctx.fillText(text, chipX + padX, chipY + 0.5)
       ctx.restore()
     }
 
-    line(yHead, style.headOn, '👤 머리를 여기에')
-    line(yFeet, style.feetOn, '👣 발을 여기에')
+    line(yHead, view.headCut, '👤 머리')
+    line(yFeet, view.feetCut, '👣 발')
     ctx.restore()
   }
 
@@ -369,6 +357,7 @@ function drawSilhouette(
   matte: HTMLCanvasElement,
   stage: StageRect,
   colorRGB: string,
+  alpha = 1,
 ) {
   const tint = tintCanvas(matte, colorRGB)
   ctx.save()
@@ -382,9 +371,41 @@ function drawSilhouette(
   ctx.clip()
   ctx.shadowColor = `rgba(${colorRGB},0.95)`
   ctx.shadowBlur = 26
-  ctx.globalAlpha = 0.9
+  ctx.globalAlpha = 0.9 * alpha
   ctx.drawImage(tint, dx, dy, dw, dh)
   // second pass boosts the core
+  ctx.shadowBlur = 8
+  ctx.globalAlpha = 0.85 * alpha
+  ctx.drawImage(tint, dx, dy, dw, dh)
+  ctx.restore()
+}
+
+/**
+ * Draw the silhouette warped by the standing `cal` into the canonical pose
+ * frame — the exact mapping judgment uses — so the on-screen body lines up with
+ * the hole no matter where/how big the player is in the camera.
+ */
+function drawSilhouetteCalibrated(
+  ctx: CanvasRenderingContext2D,
+  matte: HTMLCanvasElement,
+  cal: Calibration,
+  stage: StageRect,
+  colorRGB: string,
+) {
+  const tint = tintCanvas(matte, colorRGB)
+  const s = (BODY_FRAME.feetY - BODY_FRAME.headY) / Math.max(1e-3, cal.bottom - cal.top)
+  const dw = s * stage.w
+  const dh = s * stage.h
+  const dx = stage.x + (0.5 - cal.centerX * s) * stage.w
+  const dy = stage.y + (BODY_FRAME.headY - cal.top * s) * stage.h
+  ctx.save()
+  ctx.beginPath()
+  roundRect(ctx, stage.x, stage.y, stage.w, stage.h, 18)
+  ctx.clip()
+  ctx.shadowColor = `rgba(${colorRGB},0.95)`
+  ctx.shadowBlur = 26
+  ctx.globalAlpha = 0.9
+  ctx.drawImage(tint, dx, dy, dw, dh)
   ctx.shadowBlur = 8
   ctx.globalAlpha = 0.85
   ctx.drawImage(tint, dx, dy, dw, dh)

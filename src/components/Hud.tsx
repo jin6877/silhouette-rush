@@ -1,16 +1,12 @@
 import type { Snapshot } from '../game/useSilhouetteRush'
-import { ZOOM_MIN, ZOOM_MAX } from '../game/useSilhouetteRush'
-import type { CaptureTransform } from '../game/maskSource'
 import { PosePreview } from './PosePreview'
 
 interface Props {
   snap: Snapshot
-  transform: CaptureTransform
-  onZoom: (zoom: number) => void
   onQuit: () => void
 }
 
-export function Hud({ snap, transform, onZoom, onQuit }: Props) {
+export function Hud({ snap, onQuit }: Props) {
   const hasWall = snap.poseName != null
   const countdown = hasWall ? Math.max(1, Math.ceil(snap.timeToImpact)) : null
   const showBigCount = hasWall && snap.timeToImpact <= 3 && snap.progress < 0.98
@@ -58,22 +54,6 @@ export function Hud({ snap, transform, onZoom, onQuit }: Props) {
           <div className="rounded-full border border-[rgba(168,85,247,0.35)] bg-[rgba(30,12,56,0.6)] px-3 py-1 text-xs font-bold text-mist-200 backdrop-blur">
             라운드 {snap.round}
           </div>
-          {/* Quick in-game zoom (carried over from framing, live-adjustable) */}
-          <label className="pointer-events-auto flex items-center gap-1.5 rounded-full border border-[rgba(168,85,247,0.3)] bg-[rgba(30,12,56,0.55)] px-2.5 py-1 backdrop-blur">
-            <span className="text-[11px] font-bold text-mist-300">🔍</span>
-            <input
-              type="range"
-              min={ZOOM_MIN}
-              max={ZOOM_MAX}
-              step={0.01}
-              value={transform.zoom}
-              onChange={(e) => onZoom(Number(e.target.value))}
-              className="zoom-slider h-1 w-20 cursor-pointer appearance-none rounded-full bg-[rgba(255,255,255,0.14)]"
-            />
-            <span className="w-8 text-right text-[11px] font-bold tabular-nums text-neon-cyan-soft">
-              {Math.round(transform.zoom * 100)}%
-            </span>
-          </label>
           <button
             onClick={onQuit}
             className="pointer-events-auto rounded-full border border-[rgba(168,85,247,0.3)] bg-[rgba(30,12,56,0.5)] px-3 py-1 text-xs font-semibold text-mist-400 backdrop-blur transition hover:text-mist-50"

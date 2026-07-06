@@ -9,10 +9,12 @@ import {
   buildPoseMask,
   createMask,
   judge,
+  normalizePlayer,
   type Mask,
   type Pose,
   type JudgeResult,
   type JudgeConfig,
+  type Calibration,
 } from './masks'
 
 export type Phase = 'ready' | 'playing' | 'gameover'
@@ -78,6 +80,11 @@ export function judgeConfigForRound(round: number): JudgeConfig {
 export interface GameState {
   config: GameConfig
   phase: Phase
+  // Standing body reference captured in the framing countdown. When set, every
+  // judged frame is warped into the canonical pose frame relative to it, so the
+  // player passes by matching the pose shape regardless of where/how big they
+  // appear in the camera. Null = legacy raw judgment (must fill the frame).
+  calibration: Calibration | null
   wall: Wall | null
   betweenTimer: number
   round: number // walls spawned so far
@@ -98,10 +105,15 @@ export interface GameState {
 
 const EMPTY_MASK = createMask()
 
-export function createGame(config: GameConfig = defaultConfig(), seed = 1): GameState {
+export function createGame(
+  config: GameConfig = defaultConfig(),
+  seed = 1,
+  calibration: Calibration | null = null,
+): GameState {
   return {
     config,
     phase: 'ready',
+    calibration,
     wall: null,
     betweenTimer: config.firstDelay,
     round: 0,
@@ -190,7 +202,10 @@ export function stepGame(state: GameState, player: Mask | null, dt: number): Gam
   dt = Math.min(dt, 1 / 20)
   state.elapsed += dt
 
-  const p = player ?? EMPTY_MASK
+  // Normalize the live silhouette into the canonical pose frame (body-relative
+  // judgment). The pure judge() below is unchanged — this is a preprocessing
+  // step so the same overlap logic works no matter where the player stands.
+  const p = normalizePlayer(player ?? EMPTY_MASK, state.calibration)
 
   if (state.wall) {
     const wall = state.wall

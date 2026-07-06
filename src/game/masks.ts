@@ -566,6 +566,91 @@ export const BODY_FRAME: { headY: number; feetY: number } = (() => {
   return { headY: b.top, feetY: b.bottom }
 })()
 
+// --- Body-relative judgment normalization -------------------------------
+// The core of the redesign: instead of forcing the player to fill a fixed
+// on-screen frame, we map the player's *own* body into the canonical pose
+// frame before judging. A short "가만히 서 있기" countdown in the framing step
+// captures the player's standing body range (head-top / feet-bottom / centre-x)
+// as a Calibration; every judged frame is then warped by the SAME similarity
+// transform (uniform scale + translate) so that, whatever the player's size,
+// distance, or position in the camera, doing the right pose lands inside the
+// hole. Uniform scale (not per-axis) preserves the pose's shape so a T-pose
+// stays a T-pose and a crouch stays a crouch.
+
+export interface Calibration {
+  top: number // normalized head-top of the standing reference body
+  bottom: number // normalized feet-bottom of the standing reference body
+  centerX: number // normalized horizontal centre of the reference body
+}
+
+/** Average a list of bounds into a Calibration (falls back to `last`). */
+export function captureCalibration(samples: MaskBounds[], last?: MaskBounds | null): Calibration {
+  const usable = samples.filter((s) => s.present)
+  if (usable.length === 0) {
+    const b = last && last.present ? last : null
+    return b
+      ? { top: b.top, bottom: b.bottom, centerX: b.centerX }
+      : { top: BODY_FRAME.headY, bottom: BODY_FRAME.feetY, centerX: 0.5 }
+  }
+  let top = 0
+  let bottom = 0
+  let cx = 0
+  for (const s of usable) {
+    top += s.top
+    bottom += s.bottom
+    cx += s.centerX
+  }
+  const n = usable.length
+  return { top: top / n, bottom: bottom / n, centerX: cx / n }
+}
+
+/**
+ * Warp `player` (camera space) into the canonical pose frame using the standing
+ * `cal`. A similarity transform maps the calibrated body's [top,bottom] onto
+ * [headY,feetY] and its centreX onto 0.5, with a single uniform scale so pose
+ * shape is preserved. Nearest-neighbour is plenty at grid resolution. Pure.
+ */
+export function warpToCanonical(player: Mask, cal: Calibration): Mask {
+  const { width: w, height: h } = player
+  const out = createMask(w, h)
+  const s = (BODY_FRAME.feetY - BODY_FRAME.headY) / Math.max(1e-3, cal.bottom - cal.top)
+  const invS = 1 / s
+  for (let oy = 0; oy < h; oy++) {
+    const nY = (oy + 0.5) / h
+    const py = cal.top + (nY - BODY_FRAME.headY) * invS
+    const sy = Math.floor(py * h)
+    if (sy < 0 || sy >= h) continue
+    const srow = sy * w
+    const drow = oy * w
+    for (let ox = 0; ox < w; ox++) {
+      const nX = (ox + 0.5) / w
+      const px = cal.centerX + (nX - 0.5) * invS
+      const sx = Math.floor(px * w)
+      if (sx < 0 || sx >= w) continue
+      out.data[drow + ox] = player.data[srow + sx]
+    }
+  }
+  return out
+}
+
+/**
+ * Normalize a live player silhouette for judgment. With a Calibration, the body
+ * is warped into the canonical frame (size/position/distance independent). Below
+ * `minArea` of raw body, or with no body, an empty mask is returned so "not
+ * detected" still fails. With no calibration this is the identity (legacy raw
+ * judgment — the player must fill the frame themselves). Pure.
+ */
+export function normalizePlayer(
+  player: Mask,
+  cal: Calibration | null,
+  minArea = 0.02,
+): Mask {
+  if (!cal) return player
+  const b = maskBounds(player)
+  if (!b.present || b.area < minArea) return createMask(player.width, player.height)
+  return warpToCanonical(player, cal)
+}
+
 /**
  * Builds the SOLID wall mask for a pose (255 = solid, 0 = open hole).
  * The hole is dilated a little so players are not punished for imperfect edges.

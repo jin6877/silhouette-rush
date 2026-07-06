@@ -23,15 +23,22 @@ import {
   createMask,
   buildPoseMask,
   maskBounds,
+  captureCalibration,
   BODY_FRAME,
   type Mask,
   type MaskBounds,
+  type Calibration,
 } from './masks'
 
 export type Status = 'idle' | 'loading' | 'framing' | 'playing' | 'gameover'
 
-// How close (normalized 0..1) the head/feet must sit to their guide lines.
-const ALIGN_TOL = 0.06
+// Framing "가만히 서 있기" calibration countdown.
+const COUNT_SECONDS = 3 // hold still this long to capture the standing body
+const SAMPLE_WINDOW = 0.6 // average the body bounds over the final N seconds
+// A body whose top/bottom touches within this of the frame edge is "cut off"
+// — digital zoom can't widen the camera FOV, so we tell the player to move the
+// camera rather than zoom, and we refuse to calibrate a cut body.
+const CUT_EDGE = 0.02
 
 // Capture-framing (zoom / vertical offset) persistence + limits.
 const TRANSFORM_KEY = 'silhouette-rush:transform'
@@ -58,30 +65,39 @@ function loadTransform(): CaptureTransform {
   }
 }
 
-/** Where the live body's head/feet sit vs. the pose reference frame. */
-function alignmentView(b: MaskBounds | null): FramingView {
-  if (!b || !b.present) return { present: false, headOn: false, feetOn: false }
-  const headOn = Math.abs(b.top - BODY_FRAME.headY) <= ALIGN_TOL
-  // Feet-bottom is clamped at 1.0 by the frame edge, so "on" means "reaches
-  // within tolerance of the feet line" (near the bottom).
-  const feetOn = b.bottom >= BODY_FRAME.feetY - ALIGN_TOL
-  return { present: true, headOn, feetOn }
+/** Where the live body's head/feet sit and whether the frame edge cuts them. */
+function framingView(b: MaskBounds | null): FramingView {
+  if (!b || !b.present) {
+    return { present: false, top: 0, bottom: 1, headCut: false, feetCut: false }
+  }
+  return {
+    present: true,
+    top: b.top,
+    bottom: b.bottom,
+    headCut: b.top <= CUT_EDGE,
+    feetCut: b.bottom >= 1 - CUT_EDGE,
+  }
 }
 
-/** One concise, actionable framing instruction. */
-function framingHint(b: MaskBounds | null, v: FramingView): string {
-  if (!b || !v.present) return '카메라 앞에 서서 전신이 보이게 해주세요'
-  if (v.headOn && v.feetOn) return '완벽해요! 아래 시작 버튼을 누르세요'
-  const bodyH = b.bottom - b.top
-  const targetH = BODY_FRAME.feetY - BODY_FRAME.headY
-  if (b.top < BODY_FRAME.headY - ALIGN_TOL) return '줌을 줄이거나 뒤로 — 머리가 위로 잘려요'
-  if (bodyH < targetH - 0.1) return '줌을 키우거나 앞으로 — 몸이 프레임을 꽉 채우게'
-  if (!v.feetOn) return '발이 아래 선에 닿게 — 줌을 줄이거나 뒤로 물러나요'
-  if (!v.headOn) return '머리를 위 선까지 — 줌을 키우거나 앞으로 오세요'
-  return '줌 슬라이더로 머리는 위 선, 발은 아래 선에 맞춰요'
+/**
+ * One concise, actionable framing instruction. The cut-off cases steer the
+ * player to move/tilt the CAMERA (digital zoom can't widen the FOV), and zoom is
+ * demoted to a secondary aid.
+ */
+function framingHint(v: FramingView, phase: CalibPhase): string {
+  if (!v.present) return '카메라 앞에 서서 온몸이 보이게 서주세요'
+  if (v.headCut && v.feetCut)
+    return '머리·발이 화면 밖이에요 — 카메라를 더 뒤로 옮겨 온몸이 보이게 하세요 (줌은 보조)'
+  if (v.headCut) return '머리가 화면 위로 잘렸어요 — 카메라를 뒤로 옮기거나 위로 기울이세요'
+  if (v.feetCut) return '발이 화면 아래로 잘렸어요 — 카메라를 뒤로 옮기거나 아래로 기울이세요'
+  if (phase === 'counting') return '가만히 서 있어요… 기준 몸을 잡는 중이에요'
+  if (phase === 'done') return '기준 완료! 이제 자유롭게 서서 포즈만 맞추면 통과돼요 · 시작을 누르세요'
+  return '좋아요, 몸 전체가 보여요'
 }
 
 const BEST_KEY = 'silhouette-rush:best'
+
+export type CalibPhase = 'counting' | 'done'
 
 export interface Snapshot {
   status: Status
@@ -104,9 +120,19 @@ export interface Snapshot {
   fillRatio: number
   fps: number
   // Framing step (status === 'framing')
-  headAligned: boolean
-  feetAligned: boolean
+  headCut: boolean
+  feetCut: boolean
+  calibPhase: CalibPhase
+  calibCount: number // countdown number shown while calibrating (0 = none)
+  framingReady: boolean // calibration captured → 시작 enabled
   framingHint: string
+}
+
+interface CalibRuntime {
+  phase: CalibPhase
+  startT: number // ms timestamp the current countdown began
+  samples: MaskBounds[] // body bounds collected in the final window
+  captured: Calibration | null
 }
 
 interface Runtime {
@@ -120,6 +146,7 @@ interface Runtime {
   lastMatte: HTMLCanvasElement | null
   mode: 'framing' | 'playing'
   isFake: boolean
+  calib: CalibRuntime
 }
 
 function emptySnapshot(best: number): Snapshot {
@@ -143,8 +170,11 @@ function emptySnapshot(best: number): Snapshot {
     collisionRatio: 0,
     fillRatio: 0,
     fps: 0,
-    headAligned: false,
-    feetAligned: false,
+    headCut: false,
+    feetCut: false,
+    calibPhase: 'counting',
+    calibCount: 0,
+    framingReady: false,
     framingHint: '',
   }
 }
@@ -163,13 +193,13 @@ export interface SilhouetteRushApi {
   restart: () => void
   quit: () => void
   getLastMatte: () => HTMLCanvasElement | null
-  /** Live capture framing (zoom / vertical offset) + controls. */
+  /** Live capture framing (zoom / vertical offset) — a secondary aid now. */
   transform: CaptureTransform
   setZoom: (zoom: number) => void
   setOffsetY: (offsetY: number) => void
-  /** Measure the live silhouette and snap zoom/offset so head+feet hit the lines. */
-  autoFit: () => void
   resetTransform: () => void
+  /** Restart the "가만히 서 있기" countdown to re-capture the standing body. */
+  recalibrate: () => void
 }
 
 export function useSilhouetteRush(): SilhouetteRushApi {
@@ -184,9 +214,12 @@ export function useSilhouetteRush(): SilhouetteRushApi {
   const lastOptsRef = useRef<{ fake?: boolean } | undefined>(undefined)
 
   // Capture framing (zoom/offset). Restored from localStorage; a ref mirrors it
-  // so imperative callbacks (autoFit, source (re)start) read the live value.
+  // so imperative callbacks (source (re)start) read the live value.
   const [transform, setTransform] = useState<CaptureTransform>(() => loadTransform())
   const transformRef = useRef(transform)
+  // Standing-body calibration captured by the framing countdown (mirrors the
+  // active runtime capture so beginPlay can seed the game with it).
+  const calibrationRef = useRef<Calibration | null>(null)
 
   useEffect(() => {
     const raw = Number(localStorage.getItem(BEST_KEY) || '0')
@@ -210,46 +243,41 @@ export function useSilhouetteRush(): SilhouetteRushApi {
     rt.current?.source.setTransform?.(transform)
   }, [transform])
 
-  const setZoom = useCallback((zoom: number) => {
-    setTransform((t) => ({ ...t, zoom: clamp(zoom, ZOOM_MIN, ZOOM_MAX) }))
+  /** (Re)start the "가만히 서 있기" countdown. Also clears any captured body. */
+  const restartCountdown = useCallback(() => {
+    const r = rt.current
+    if (!r) return
+    calibrationRef.current = null
+    r.calib = { phase: 'counting', startT: performance.now(), samples: [], captured: null }
   }, [])
 
-  const setOffsetY = useCallback((offsetY: number) => {
-    setTransform((t) => ({ ...t, offsetY: clamp(offsetY, OFFSET_MIN, OFFSET_MAX) }))
-  }, [])
+  // Changing the capture framing (zoom/offset) moves the whole body in the
+  // camera, so any captured standing reference is stale — re-run the countdown.
+  const setZoom = useCallback(
+    (zoom: number) => {
+      setTransform((t) => ({ ...t, zoom: clamp(zoom, ZOOM_MIN, ZOOM_MAX) }))
+      if (rt.current?.mode === 'framing') restartCountdown()
+    },
+    [restartCountdown],
+  )
+
+  const setOffsetY = useCallback(
+    (offsetY: number) => {
+      setTransform((t) => ({ ...t, offsetY: clamp(offsetY, OFFSET_MIN, OFFSET_MAX) }))
+      if (rt.current?.mode === 'framing') restartCountdown()
+    },
+    [restartCountdown],
+  )
 
   const resetTransform = useCallback(() => {
     setTransform({ zoom: 1, offsetY: 0, offsetX: 0 })
-  }, [])
+    restartCountdown()
+  }, [restartCountdown])
 
-  /**
-   * Measure where the live silhouette's head/feet currently sit (through the
-   * transform already in effect) and solve for the zoom+offset that lands the
-   * body's head on the head line and feet on the feet line — a one-tap framing.
-   * Works from the current transform so it composes correctly even after manual
-   * slider tweaks. (Scale about centre + normalized offset is affine, so this is
-   * a direct algebraic solve, clamped to the slider range.)
-   */
-  const autoFit = useCallback(() => {
-    const r = rt.current
-    if (!r) return
-    const mask = r.source.read()
-    const b = mask ? maskBounds(mask) : null
-    if (!b || !b.present) return
-    const t = transformRef.current
-    const dispH = b.bottom - b.top
-    if (dispH < 0.02) return
-    const targetH = BODY_FRAME.feetY - BODY_FRAME.headY
-    const zoom = clamp(t.zoom * (targetH / dispH), ZOOM_MIN, ZOOM_MAX)
-    // Un-transform the body's centre back to "raw" (centre-relative) coords,
-    // then re-place it centred between the two guide lines at the new zoom.
-    const rawMidC = ((b.top + b.bottom) / 2 - 0.5 - t.offsetY) / t.zoom
-    const targetMid = (BODY_FRAME.headY + BODY_FRAME.feetY) / 2
-    const offsetY = clamp(targetMid - 0.5 - rawMidC * zoom, OFFSET_MIN, OFFSET_MAX)
-    const rawCxC = (b.centerX - 0.5 - (t.offsetX ?? 0)) / t.zoom
-    const offsetX = clamp(-rawCxC * zoom, OFFSET_MIN, OFFSET_MAX)
-    setTransform({ zoom, offsetY, offsetX })
-  }, [])
+  /** Re-run the standing-body countdown (exposed as "다시 맞추기"). */
+  const recalibrate = useCallback(() => {
+    restartCountdown()
+  }, [restartCountdown])
 
   const stop = useCallback(() => {
     if (rt.current) {
@@ -281,7 +309,16 @@ export function useSilhouetteRush(): SilhouetteRushApi {
     const r = rt.current
     if (!r || r.mode === 'playing') return
     r.renderer.reset()
-    r.state = createGame(defaultConfig(), (Date.now() & 0xffffffff) >>> 0)
+    // Seed the round with the standing body captured in the countdown so pose
+    // judgment is normalized to the player's own frame (falls back to a live
+    // one-shot capture if they somehow skipped the countdown).
+    let cal = r.calib.captured ?? calibrationRef.current
+    if (!cal) {
+      const b = r.source.read()
+      const mb = b ? maskBounds(b) : null
+      if (mb?.present) cal = { top: mb.top, bottom: mb.bottom, centerX: mb.centerX }
+    }
+    r.state = createGame(defaultConfig(), (Date.now() & 0xffffffff) >>> 0, cal ?? null)
     r.mode = 'playing'
     setSnap((s) => ({ ...emptySnapshot(s.best), status: 'playing', best: s.best }))
   }, [])
@@ -316,10 +353,31 @@ export function useSilhouetteRush(): SilhouetteRushApi {
 
       const ctx = canvas.getContext('2d')!
 
-      // --- Framing step: align head/feet to the guide lines before playing ---
+      // --- Framing step: capture the standing body via a hold-still countdown ---
       if (r.mode === 'framing') {
         const b = mask ? maskBounds(mask) : null
-        const view = alignmentView(b)
+        const view = framingView(b)
+        const cut = !view.present || view.headCut || view.feetCut
+        const cal = r.calib
+        let count = 0
+
+        if (cal.phase === 'counting') {
+          if (cut) {
+            // Body isn't fully in frame — hold/reset the countdown until it is.
+            cal.startT = now
+            cal.samples = []
+          } else {
+            const remain = COUNT_SECONDS - (now - cal.startT) / 1000
+            count = Math.max(0, Math.ceil(remain))
+            if (remain <= SAMPLE_WINDOW && b?.present) cal.samples.push(b)
+            if (remain <= 0) {
+              cal.captured = captureCalibration(cal.samples, b)
+              cal.phase = 'done'
+              calibrationRef.current = cal.captured
+            }
+          }
+        }
+
         r.renderer.drawFraming(ctx, r.lastMatte, view, dt, rect.width, rect.height, r.dpr)
 
         setSnap((s) => ({
@@ -327,9 +385,12 @@ export function useSilhouetteRush(): SilhouetteRushApi {
           status: 'framing',
           phase: 'ready',
           present: view.present,
-          headAligned: view.headOn,
-          feetAligned: view.feetOn,
-          framingHint: framingHint(b, view),
+          headCut: view.headCut,
+          feetCut: view.feetCut,
+          calibPhase: cal.phase,
+          calibCount: count,
+          framingReady: cal.phase === 'done',
+          framingHint: framingHint(view, cal.phase),
           fps: (r.source as { fps?: number }).fps ?? 0,
         }))
 
@@ -437,6 +498,7 @@ export function useSilhouetteRush(): SilhouetteRushApi {
       // to play unless a framing screenshot is explicitly requested.
       const useFraming = !opts?.fake || !!opts?.framing
 
+      calibrationRef.current = null
       rt.current = {
         source,
         state: useFraming
@@ -450,6 +512,7 @@ export function useSilhouetteRush(): SilhouetteRushApi {
         lastMatte: null,
         mode: useFraming ? 'framing' : 'playing',
         isFake: !!opts?.fake,
+        calib: { phase: 'counting', startT: performance.now(), samples: [], captured: null },
       }
       setSnap((s) => ({
         ...emptySnapshot(s.best),
@@ -490,59 +553,108 @@ export function useSilhouetteRush(): SilhouetteRushApi {
   // --- Test / demo hooks for headless verification (Playwright) ---
   useEffect(() => {
     const w = window as unknown as Record<string, unknown>
+    // Place a canonical mask into the camera frame at `cal` (inverse of the
+    // judgment warp) so we can simulate a player who appears small / off to one
+    // side / partially in frame while still doing the right pose.
+    const placeInCamera = (src: Mask, cal: Calibration): Mask => {
+      const out = createMask()
+      const s = (BODY_FRAME.feetY - BODY_FRAME.headY) / Math.max(1e-3, cal.bottom - cal.top)
+      for (let oy = 0; oy < MASK_H; oy++) {
+        const nY = BODY_FRAME.headY + ((oy + 0.5) / MASK_H - cal.top) * s
+        const sy = Math.floor(nY * MASK_H)
+        if (sy < 0 || sy >= MASK_H) continue
+        for (let ox = 0; ox < MASK_W; ox++) {
+          const nX = 0.5 + ((ox + 0.5) / MASK_W - cal.centerX) * s
+          const sx = Math.floor(nX * MASK_W)
+          if (sx < 0 || sx >= MASK_W) continue
+          out.data[oy * MASK_W + ox] = src.data[sy * MASK_W + sx]
+        }
+      }
+      return out
+    }
+    // A stand pose placed at `cal` — the "standing body" the player calibrates on.
+    const standAt = (cal: Calibration): Mask => placeInCamera(buildPoseMask(POSES[0]), cal)
+    // The current wall's ideal fit, or a wrong pose, placed at the game's calibration.
+    const poseAt = (src: Mask | null): Mask => {
+      const st = rt.current?.state
+      const cal = st?.calibration
+      if (!src) return createMask()
+      return cal ? placeInCamera(src, cal) : src
+    }
     const fitMaskForWall = (): Mask | null => {
       const st = rt.current?.state
       if (!st?.wall) return null
-      return erodeMask(st.wall.holeMask, 2)
+      return poseAt(erodeMask(st.wall.holeMask, 2))
     }
-    const missMask = (): Mask => {
+    const missMaskForWall = (): Mask => {
+      const st = rt.current?.state
+      // A clearly different pose (or a left column when no wall) → collides.
+      if (st?.wall) {
+        const other = POSES.find((p) => p.id !== st.wall!.pose.id && p.difficulty <= 2) ?? POSES[1]
+        return poseAt(erodeMask(buildPoseMask(other), 2))
+      }
       const m = createMask()
       for (let y = Math.floor(0.05 * MASK_H); y < Math.floor(0.98 * MASK_H); y++)
         for (let x = 0; x < Math.floor(0.3 * MASK_W); x++) m.data[y * MASK_W + x] = 255
       return m
     }
+    const setSourceMask = (m: Mask | null) => {
+      const s = rt.current?.source
+      if (s instanceof FakeMaskSource) s.setMask(m)
+    }
     w.__silhouetteRush = {
       startFake: () => start({ fake: true }),
-      // Enter the framing step with a fake source, injecting a body silhouette so
-      // the guide lines + alignment feedback are visible for screenshots.
-      startFakeFraming: async (kind?: string) => {
+      // Enter the framing step with a fake source. `cal` places the standing body
+      // (small / off-centre / partly cut) so the snapped guides, the countdown,
+      // and the cut-off warning are all exercisable for screenshots.
+      startFakeFraming: async (cal?: Calibration) => {
         await start({ fake: true, framing: true })
         const s = rt.current?.source
         if (!(s instanceof FakeMaskSource)) return
-        const pose =
-          kind === 'low'
-            ? POSES.find((p) => p.id === 'crouch') ?? POSES[0]
-            : POSES[0] // 'stand' — aligned to the reference frame
-        s.setMask(buildPoseMask(pose))
+        s.setMask(standAt(cal ?? { top: 0.16, bottom: 0.92, centerX: 0.5 }))
+      },
+      // Force the countdown to complete now (deterministic screenshots).
+      finishCountdown: () => {
+        const r = rt.current
+        if (!r || r.mode !== 'framing') return
+        const m = r.source.read()
+        const b = m ? maskBounds(m) : null
+        r.calib.captured = captureCalibration([], b)
+        r.calib.phase = 'done'
+        calibrationRef.current = r.calib.captured
+      },
+      recalibrate: () => recalibrate(),
+      framingState: () => {
+        const r = rt.current
+        const m = r?.source.read()
+        const b = m ? maskBounds(m) : null
+        const v = framingView(b)
+        return {
+          present: v.present,
+          headCut: v.headCut,
+          feetCut: v.feetCut,
+          phase: r?.calib.phase ?? null,
+          captured: r?.calib.captured ?? null,
+        }
       },
       beginPlay: () => beginPlay(),
-      // Framing-transform hooks so headless verification can prove the slider is
-      // wired to the live pipeline (change zoom → body bounds actually change).
       setZoom: (z: number) => setZoom(z),
       setOffsetY: (o: number) => setOffsetY(o),
-      autoFit: () => autoFit(),
       resetTransform: () => resetTransform(),
       getTransform: () => ({ ...transformRef.current }),
       getBounds: () => {
         const m = rt.current?.source.read()
         return m ? maskBounds(m) : null
       },
-      setFit: () => {
-        const s = rt.current?.source
-        if (s instanceof FakeMaskSource) s.setMask(fitMaskForWall())
+      // Overwrite the game's calibration (headless play without the countdown).
+      setCalibration: (cal: Calibration) => {
+        calibrationRef.current = cal
+        if (rt.current?.state) rt.current.state.calibration = cal
       },
-      setMiss: () => {
-        const s = rt.current?.source
-        if (s instanceof FakeMaskSource) s.setMask(missMask())
-      },
-      setNone: () => {
-        const s = rt.current?.source
-        if (s instanceof FakeMaskSource) s.setMask(null)
-      },
-      autopilot: () => {
-        const s = rt.current?.source
-        if (s instanceof FakeMaskSource) s.setMask(fitMaskForWall())
-      },
+      setFit: () => setSourceMask(fitMaskForWall()),
+      setMiss: () => setSourceMask(missMaskForWall()),
+      setNone: () => setSourceMask(null),
+      autopilot: () => setSourceMask(fitMaskForWall()),
       state: () => {
         const st = rt.current?.state
         return {
@@ -556,13 +668,14 @@ export function useSilhouetteRush(): SilhouetteRushApi {
           hasWall: !!st?.wall,
           progress: st?.wall?.progress ?? 0,
           poseName: st?.wall?.pose.name ?? null,
+          calibrated: !!st?.calibration,
         }
       },
     }
     return () => {
       delete w.__silhouetteRush
     }
-  }, [start, beginPlay, setZoom, setOffsetY, autoFit, resetTransform])
+  }, [start, beginPlay, setZoom, setOffsetY, resetTransform, recalibrate])
 
   return {
     canvasRef,
@@ -579,8 +692,8 @@ export function useSilhouetteRush(): SilhouetteRushApi {
     transform,
     setZoom,
     setOffsetY,
-    autoFit,
     resetTransform,
+    recalibrate,
   }
 }
 

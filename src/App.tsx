@@ -1,7 +1,7 @@
 import { useSilhouetteRush } from './game/useSilhouetteRush'
 import { StartScreen } from './components/StartScreen'
 import { LoadingOverlay } from './components/LoadingOverlay'
-import { FramingOverlay } from './components/FramingOverlay'
+import { FramingPanel } from './components/FramingOverlay'
 import { Hud } from './components/Hud'
 import { GameOverScreen } from './components/GameOverScreen'
 
@@ -23,38 +23,39 @@ export default function App() {
         />
       )}
 
-      {/* Game stage — kept mounted while playing/over so the canvas persists */}
-      <div className={`relative h-[100svh] w-full ${showCanvas ? 'block' : 'hidden'}`}>
-        <canvas ref={game.canvasRef} className="block h-full w-full" />
+      {/* Game stage — kept mounted while playing/over so the canvas persists.
+          During framing a control column sits BESIDE (desktop) or BELOW (narrow)
+          the camera view so nothing ever floats over the silhouette. */}
+      <div
+        className={`h-[100svh] w-full ${
+          snap.status === 'framing' ? 'flex flex-col md:flex-row' : 'block'
+        } ${showCanvas ? '' : 'hidden'}`}
+      >
+        <div className="relative min-h-0 w-full flex-1">
+          <canvas ref={game.canvasRef} className="block h-full w-full" />
+
+          {snap.status === 'playing' && <Hud snap={snap} onQuit={game.quit} />}
+
+          {snap.status === 'gameover' && (
+            <GameOverScreen
+              snap={snap}
+              matte={game.getLastMatte()}
+              onRetry={game.restart}
+              onHome={game.quit}
+            />
+          )}
+        </div>
 
         {snap.status === 'framing' && (
-          <FramingOverlay
+          <FramingPanel
             snap={snap}
             transform={game.transform}
             onZoom={game.setZoom}
             onOffsetY={game.setOffsetY}
-            onAutoFit={game.autoFit}
+            onRecalibrate={game.recalibrate}
             onReset={game.resetTransform}
             onStart={game.startGame}
             onQuit={game.quit}
-          />
-        )}
-
-        {snap.status === 'playing' && (
-          <Hud
-            snap={snap}
-            transform={game.transform}
-            onZoom={game.setZoom}
-            onQuit={game.quit}
-          />
-        )}
-
-        {snap.status === 'gameover' && (
-          <GameOverScreen
-            snap={snap}
-            matte={game.getLastMatte()}
-            onRetry={game.restart}
-            onHome={game.quit}
           />
         )}
       </div>
